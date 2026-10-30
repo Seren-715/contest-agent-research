@@ -10,7 +10,7 @@ from typing import Any, Optional
 from core.config import Settings, load_settings
 from core.io import OutputError, check_figures, write_report, write_result
 from core.llm import ModelClient, ModelError
-from core.paperlib import Paper, evidence_excerpt, index_materials, resolve_materials
+from core.paperlib import MaterialResolutionError, evidence_excerpt, index_materials, resolve_materials
 from core.schemas import report_limit_errors, validate_answer
 from core.execution import ExecutionCancelled
 from d_adapter.gateway import GenerationError
@@ -155,8 +155,7 @@ def _fallback_chat(case_id: str) -> dict[str, Any]:
 
 
 def _evidence_quote(record: Any, query: str, limit: int = 520) -> str:
-    paper = Paper(path=record.path, filename=record.filename, text=record.text)
-    return " ".join(evidence_excerpt(paper, query=query, max_chars=limit).split())
+    return " ".join(evidence_excerpt(record, query=query, max_chars=limit).split())
 
 
 def _fallback_report(settings: Settings, question: dict[str, Any], function: str) -> Optional[dict[str, Any]]:
@@ -168,11 +167,11 @@ def _fallback_report(settings: Settings, question: dict[str, Any], function: str
     if function != "Survey":
         return None
     try:
-        paths = resolve_materials(question.get("materials"), settings.data_dir)[:6]
+        paths = resolve_materials(question.get("materials"), settings.data_dir)
         if not paths:
             return None
-        records = index_materials(paths, max_pages=12)
-        if not records:
+        records = index_materials(paths)
+        if not records or any(not record.text.strip() for record in records):
             return None
         case_id = question["case_id"]
         query = str(question.get("input") or question.get("title") or "").strip()
@@ -235,7 +234,7 @@ def solve_task(task_input: dict[str, Any], settings: Optional[Settings] = None) 
         # JSON; return it exactly. Do not add an SDK-style `answer` wrapper for
         # B/C/D/E (it would be an extra top-level field and fail the schema).
         return data
-    except (HandlerError, ModelError, OutputError, DAdapterError, GenerationError, RunnerError, TimeoutError) as exc:
+    except (HandlerError, MaterialResolutionError, ModelError, OutputError, DAdapterError, GenerationError, RunnerError, TimeoutError) as exc:
         if isinstance(exc, ExecutionCancelled):
             raise
         if function == "Reproduction":

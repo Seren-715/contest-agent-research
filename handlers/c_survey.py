@@ -7,13 +7,17 @@ one complete revision, and missing coverage is completed with verbatim excerpts.
 
 from __future__ import annotations
 
+from dataclasses import replace
+import logging
 from typing import Any
 
-from core.config import Settings
-from core.llm import ModelClient
+from core.budget import Deadline
+from core.config import Settings, case_budget_seconds
+from core.execution import check_active
+from core.llm import ModelClient, ModelError
 from core.paperlib import resolve_materials
 from handlers.base import HandlerError, constraints_text, question_text
-from handlers.reporting import audit, finalize, materials_bundle
+from handlers.reporting import audit, finalize, survey_materials_bundle as materials_bundle
 
 SYSTEM = (
     "你是严谨的文献综述作者，按 PaperCode 的 Gate-Honest / ClaimLedger 纪律工作："
@@ -35,19 +39,24 @@ CLAIM_RULES = (
 
 class SurveyHandler:
     def handle(self, question: dict[str, Any], settings: Settings, client: ModelClient) -> dict[str, Any]:
+        deadline = Deadline(case_budget_seconds("Survey", settings))
         case_id = question["case_id"]
         query = question_text(question)
         paths = resolve_materials(question.get("materials"), settings.data_dir)
         if not paths:
             raise HandlerError("survey materials are missing: no PDFs resolved")
-        paths = paths[:6]
-        block, records = materials_bundle(paths, query=query, max_chars=1800)
+        block, records = materials_bundle(paths, query=query, deadline=deadline)
         extra = constraints_text(question)
         base_prompt = (
             f"综述任务：{query}\n\n"
             f"额外约束：\n{extra or '（无）'}\n\n"
-            "指定论文（编号、完整文件名与证据摘录）：\n"
+            "指定论文的候选证据矩阵（编号、完整文件名、内容哈希、PDF页码和原文跨度）：\n"
             f"{block}\n\n"
+            "矩阵标签仅用于检索原文，不是已核实事实；先按研究问题、方法、数据与实验条件、指标、"
+            "结果与比较、局限六维整理各论文事实，再写综述。缺失信息明确未核验，不补造。"
+            "具体数值须同时核对方法、数据集、单位、指标、实验条件和比较对象；"
+            "原文存在同一数字不等于支持该事实。尽量覆盖各篇论文的具体贡献和条件，"
+            "不要仅写少量正确但空泛的背景。只有真实定位的页码才可引用。\n\n"
             f"{CLAIM_RULES}\n\n"
             "请写一篇正文 800～5000 字符（建议约3500）的中文 Markdown 综述，要求：\n"
             "正文排除标题行及参考文献节，空格、标点和内部换行计入；正文数字引用标记最多40组，"
@@ -61,27 +70,39 @@ class SurveyHandler:
             "5. 结尾必须有 '## 参考文献'，逐条列出 [编号] 和完整 PDF 文件名；\n"
             "6. 直接输出 Markdown 正文，不要 JSON、不要代码围栏。"
         )
-        text = client.complete(
+        def complete(messages: list[dict[str, str]], temperature: float) -> str:
+            check_active()
+            timeout = deadline.timeout(settings.request_timeout, label="survey generation")
+            bounded = replace(client, timeout=min(client.timeout, timeout)) if isinstance(client, ModelClient) else client
+            return bounded.complete(messages, temperature=temperature, max_tokens=6000)
+
+        text = complete(
             [{"role": "system", "content": SYSTEM}, {"role": "user", "content": base_prompt}],
-            temperature=0.25,
-            max_tokens=6000,
+            0.25,
         )
         markdown = text.strip()
         report = audit(markdown, records, "Survey")
-        if report.blockers:
+        if report.blockers and deadline.remaining() >= 30:
             repair = (
-                base_prompt
-                + "\n\n【证据闸门未通过】\n"
+                "【证据闸门未通过】\n"
                 + report.repair_text()
-                + "\n\n请返回完整修订版（不要只给差异）：补齐引用和参考文献，删除无法核验的事实，"
-                "保持原有章节结构，只输出 Markdown 正文。"
+                + "\n\n以上一条草稿为基础，仅修复指出的问题，保留已经有来源的具体事实、条件、数值和章节。"
+                "补齐可确认的引用和参考文献；没有原文支持则删除或明确未核验，不另造事实。"
+                "修复后重新核对全篇5000正文字符/40引用组限制，返回完整修订版（不要只给差异）。"
             )
-            text = client.complete(
-                [{"role": "system", "content": SYSTEM}, {"role": "user", "content": repair}],
-                temperature=0.15,
-                max_tokens=6000,
-            )
-            markdown = text.strip()
+            try:
+                candidate = complete(
+                    [{"role": "system", "content": SYSTEM}, {"role": "user", "content": base_prompt},
+                     {"role": "assistant", "content": markdown}, {"role": "user", "content": repair}],
+                    0.15,
+                ).strip()
+                if len(audit(candidate, records, "Survey").blockers) <= len(report.blockers):
+                    markdown = candidate
+            except (ModelError, TimeoutError):
+                # Keep the existing draft for the source-excerpt finalizer;
+                # neither an upstream retry failure nor uncertainty erases it.
+                check_active()
+                logging.getLogger(__name__).warning("survey_repair_failed case_id=%s", case_id)
         return finalize(
             settings,
             "Survey",

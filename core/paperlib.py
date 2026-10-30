@@ -9,15 +9,20 @@ over the local corpus instead of raw term counts.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from pypdf import PdfReader
+
+from core.budget import Deadline
+from core.execution import check_active, current_execution
 
 TOKEN_RE = re.compile(r"[a-z0-9]+|[一-鿿]+", re.IGNORECASE)
 SENTENCE_RE = re.compile(r"[^。！？!?\.]+[。！？!?\.]?")
@@ -41,6 +46,16 @@ class Paper:
 
 
 @dataclass(frozen=True)
+class EvidencePassage:
+    """One exact span in a PDF page's pypdf extraction, before normalization."""
+
+    page: int
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
 class MaterialRecord:
     """Indexed evidence for one specified paper (PaperCode MaterialIndex.v1 port)."""
 
@@ -52,6 +67,9 @@ class MaterialRecord:
     title: str
     abstract: str
     text: str
+    passages: tuple[EvidencePassage, ...] = ()
+    indexed_pages: tuple[int, ...] = ()
+    warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +79,8 @@ class MaterialRecord:
             "pages": self.pages,
             "title": self.title,
             "abstract": self.abstract[:500],
+            "indexed_pages": list(self.indexed_pages),
+            "warnings": list(self.warnings),
         }
 
 
@@ -153,7 +173,15 @@ def load_papers(paths: Iterable[Path], max_pages: int = 4) -> list[Paper]:
 
 
 def terms(text: str) -> list[str]:
-    return [match.group(0).lower() for match in TOKEN_RE.finditer(text or "")]
+    tokens: list[str] = []
+    for match in TOKEN_RE.finditer(text or ""):
+        value = match.group(0).lower()
+        tokens.append(value)
+        # No external dictionary is needed to match a phrase inside a longer
+        # Chinese sentence. Whole runs alone made almost every such match fail.
+        if len(value) > 2 and "一" <= value[0] <= "鿿":
+            tokens.extend(value[index:index + 2] for index in range(len(value) - 1))
+    return tokens
 
 
 def file_sha256(path: Path) -> str:
@@ -209,13 +237,35 @@ def sentence_split(text: str) -> list[str]:
     return sentences
 
 
-def evidence_excerpt(paper: Paper, query: str = "", max_chars: int = 1800) -> str:
+def evidence_excerpt(paper: Paper | MaterialRecord, query: str = "", max_chars: int = 1800) -> str:
     """Title + abstract + query-relevant sentences, bounded for the prompt."""
+    if getattr(paper, "passages", ()):
+        ranked = rank_passages(query, paper)
+        header = "标题：" + paper.title[:min(160, max_chars // 5)] + "\n"
+        blocks: list[str] = []
+        remaining = max(0, max_chars - len(header))
+        for passage, _ in ranked:
+            label = f"[p.{passage.page}, chars {passage.start}:{passage.end}] "
+            value = label + passage.text
+            if len(value) + 1 > remaining:
+                # Never invent a shorter span with the old span's coordinates.
+                length = remaining - len(label) - 1
+                if length > 80:
+                    label = f"[p.{passage.page}, chars {passage.start}:{passage.start + length}] "
+                    value = label + passage.text[:length]
+                else:
+                    continue
+            if len(value) + 1 <= remaining:
+                blocks.append(value)
+                remaining -= len(value) + 1
+            if remaining < 100:
+                break
+        return (header + "\n".join(blocks))[:max_chars]
     flat = " ".join((paper.text or "").split())
     if not flat:
         return f"标题：{paper_title('', paper.filename)}\n（无法提取正文）"
     title = paper_title(flat, paper.filename)
-    abstract = paper_abstract(flat)
+    abstract = paper_abstract(flat, limit=max(0, min(350, max_chars // 4)))
     query_terms = set(terms(query))
     scored: list[tuple[float, int, str]] = []
     for index, sentence in enumerate(sentence_split(flat)):
@@ -227,33 +277,140 @@ def evidence_excerpt(paper: Paper, query: str = "", max_chars: int = 1800) -> st
         method = 1.0 if FACT_HINT_RE.search(sentence) else 0.0
         scored.append((overlap * 3.0 + numeric + method, index, sentence))
     chosen = sorted(scored, key=lambda item: (-item[0], item[1]))[:8]
-    chosen.sort(key=lambda item: item[1])
+    # Preserve relevance order so a long early sentence cannot push a more
+    # relevant results sentence out of the prompt.
     key_sentences = " ".join(item[2] for item in chosen)
     block = f"标题：{title}\n摘要：{abstract}\n关键句：{key_sentences}"
     return block[:max_chars]
 
 
-def index_materials(paths: Iterable[Path], max_pages: int = 6, max_chars: int = 48000) -> list[MaterialRecord]:
-    """Build a MaterialIndex-style record list, one per specified PDF."""
+def _index_limit(name: str, default: int) -> int:
+    value = int(os.environ.get(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _passages(text: str, page: int, size: int = 1200, overlap: int = 200) -> list[EvidencePassage]:
+    values: list[EvidencePassage] = []
+    for start in range(0, len(text), size - overlap):
+        end = min(len(text), start + size)
+        if text[start:end].strip():
+            values.append(EvidencePassage(page, start, end, text[start:end]))
+        if end == len(text):
+            break
+    return values
+
+
+def rank_passages(query: str, record: MaterialRecord) -> list[tuple[EvidencePassage, float]]:
+    """Rank exact page spans, with deterministic page/offset tie breaking."""
+    passages = list(record.passages)
+    documents = [Paper(record.path, f"{item.page:08d}:{item.start:08d}", item.text) for item in passages]
+    ranked = bm25_rank(query, documents, top_k=len(documents))
+    lookup = {document.filename: passage for document, passage in zip(documents, passages)}
+    return [(lookup[document.filename], value) for document, value in ranked]
+
+
+def index_materials(
+    paths: Iterable[Path], max_pages: Optional[int] = None, max_chars: Optional[int] = None,
+    *, deadline: Optional[Deadline] = None, page_selection: str = "spread",
+) -> list[MaterialRecord]:
+    """Index all authorized files, retaining exact page spans and coverage gaps.
+
+    Limits bound work rather than silently selecting the first few papers.
+    Per-page text budgets stop a long introduction from erasing later pages.
+    No process-wide cache can mix evidence between differently scoped tasks.
+    """
+    page_limit = max_pages if max_pages is not None else _index_limit("CONTEST_PDF_MAX_PAGES", 256)
+    char_limit = max_chars if max_chars is not None else _index_limit("CONTEST_PDF_MAX_CHARS", 256000)
+    byte_limit = _index_limit("CONTEST_PDF_MAX_BYTES", 64 * 1024 * 1024)
+    total_chars = _index_limit("CONTEST_INDEX_MAX_CHARS", 8000000)
+    seconds = _index_limit("CONTEST_INDEX_SECONDS", 120)
+    control = current_execution()
+    # Parsing must leave time for generation and publication. Fallback parsing
+    # must not reset the outer case budget or consume its final ten seconds.
+    seconds = min(seconds, max(0.0, control.remaining() - 15)) if control else seconds
+    if deadline is not None:
+        seconds = min(seconds, max(0.0, deadline.remaining() - 30))
+    if page_limit <= 0 or char_limit <= 0:
+        raise ValueError("PDF page and character limits must be positive")
+    if page_selection not in ("spread", "head_tail"):
+        raise ValueError("unknown PDF page selection")
+    started = time.monotonic()
     records: list[MaterialRecord] = []
     for path in paths:
-        diagnostic = probe_pdf(path)
-        text = read_pdf_evidence(
-            path,
-            head_pages=max(1, min(int(max_pages), 8)),
-            tail_pages=4,
-            max_chars=max_chars,
-        )
+        check_active()
+        warnings: list[str] = []
+        spans: list[EvidencePassage] = []
+        indexed: list[int] = []
+        pages: Optional[int] = None
+        size = path.stat().st_size if path.is_file() else 0
+        digest = ""
+        if size > byte_limit:
+            warnings.append("pdf_byte_limit")
+        elif total_chars <= 0 or time.monotonic() - started >= seconds:
+            warnings.append("index_budget_exhausted")
+        else:
+            digest = file_sha256(path)
+            try:
+                reader = PdfReader(str(path))
+                pages = len(reader.pages)
+                # If a huge PDF exceeds the page budget, distribute selected
+                # pages across it and report incomplete coverage explicitly.
+                if pages > page_limit:
+                    if page_selection == "head_tail":
+                        tail = min(4, page_limit)
+                        selected = list(range(page_limit - tail)) + list(range(pages - tail, pages))
+                    else:
+                        selected = sorted({round(i * (pages - 1) / max(1, page_limit - 1))
+                                           for i in range(page_limit)})
+                    warnings.append("pdf_page_limit")
+                else:
+                    selected = list(range(pages))
+                per_page = min(12000, min(char_limit, total_chars) // max(1, len(selected)))
+                for number in selected:
+                    check_active()
+                    if time.monotonic() - started >= seconds:
+                        warnings.append("index_time_limit")
+                        break
+                    try:
+                        raw = reader.pages[number].extract_text() or ""
+                    except Exception:
+                        warnings.append(f"page_extract_failed:{number + 1}")
+                        continue
+                    indexed.append(number + 1)
+                    if len(raw) > per_page:
+                        warnings.append(f"page_char_limit:{number + 1}")
+                    retained = raw[:per_page]
+                    spans.extend(_passages(retained, number + 1))
+                    total_chars -= len(retained)
+            except Exception as exc:
+                # Cancellation is not a PDF parse error and must propagate.
+                check_active()
+                warnings.append("pdf_parse_failed:" + type(exc).__name__)
+        # Overlapping passages are NOT concatenated to avoid duplicate facts.
+        page_text: dict[int, str] = {}
+        for span in spans:
+            previous = page_text.get(span.page, "")
+            page_text[span.page] = previous + span.text[max(0, len(previous) - span.start):]
+        text = "\n".join(page_text.values())
+        if not text.strip():
+            warnings.append("no_extractable_text")
+        if warnings:
+            logging.getLogger(__name__).warning("material_index filename=%r warnings=%s", path.name, warnings)
         records.append(
             MaterialRecord(
                 path=path,
                 filename=path.name,
-                sha256=file_sha256(path),
-                bytes=int(diagnostic.get("size_bytes") or 0),
-                pages=diagnostic.get("pages"),
+                sha256=digest,
+                bytes=size,
+                pages=pages,
                 title=paper_title(text, path.name),
                 abstract=paper_abstract(text),
                 text=text,
+                passages=tuple(spans),
+                indexed_pages=tuple(indexed),
+                warnings=tuple(warnings),
             )
         )
     return records
@@ -332,47 +489,81 @@ def _paper_roots(settings_data_dir: Path) -> list[Path]:
     return unique
 
 
-def resolve_materials(materials: object, settings_data_dir: Path) -> list[Path]:
-    """Resolve the question's `materials` into actual PDF paths.
+class MaterialResolutionError(RuntimeError):
+    pass
 
-    Accepts a list of filenames, a directory, or a missing value. Searches the
-    contest workspace as well as the base image's read-only DATA_PATH (/data).
+
+def resolve_materials(
+    materials: object, settings_data_dir: Path, *, allow_library: bool = False,
+) -> list[Path]:
+    """Resolve only declared materials; whole-library discovery is B-only opt-in.
+
+    Missing declarations never broaden scope. Ambiguous basenames are errors,
+    not an invitation to pick whichever root happened to be searched first.
     """
     roots = _paper_roots(settings_data_dir)
-    candidates: list[Path] = []
-    if isinstance(materials, str):
-        path = Path(materials)
-        if path.is_dir():
-            candidates.extend(list_pdfs(path))
-        elif path.exists():
-            candidates.append(path)
-    elif isinstance(materials, list):
-        for item in materials:
-            if not isinstance(item, str):
-                continue
-            path = Path(item)
-            if path.is_dir():
-                candidates.extend(list_pdfs(path))
-            elif path.exists() and path.suffix.lower() == ".pdf":
-                candidates.append(path)
-            else:
-                for root in roots:
-                    found = list(root.rglob(path.name)) if root.exists() else []
-                    if found:
-                        candidates.append(found[0])
-                        break
-    if not candidates:
-        for root in roots:
+    allowed = [settings_data_dir.resolve(), Path("/data").resolve()]
+    if os.environ.get("DATA_PATH"):
+        allowed.append(Path(os.environ["DATA_PATH"]).resolve())
+
+    def within(path: Path) -> bool:
+        resolved = path.resolve()
+        return any(resolved == base or base in resolved.parents for base in allowed)
+
+    def checked(path: Path) -> Path:
+        if not within(path):
+            raise MaterialResolutionError(f"material outside allowed data roots: {path.name}")
+        return path.resolve()
+
+    missing = materials is None or materials == []
+    if missing:
+        if not allow_library:
+            return []
+        # Standard library roots can be nested; deduplicate exact paths later.
+        declared = []
+        libraries = [root for root in roots if root.name in ("论文库", "papers") and root.is_dir()]
+        for root in (libraries or roots):
             if root.exists():
-                found = list_pdfs(root)
-                if found:
-                    candidates.extend(found)
-                    break
-    # de-duplicate by filename, keep first
-    seen: set[str] = set()
+                declared.extend(list_pdfs(root))
+        candidates = [checked(path) for path in declared]
+    else:
+        values = [materials] if isinstance(materials, str) else materials
+        if not isinstance(values, list) or any(not isinstance(item, str) or not item.strip() for item in values):
+            raise MaterialResolutionError("materials must contain nonempty path strings")
+        candidates = []
+        for item in values:
+            check_active()
+            path = Path(item)
+            if ".." in path.parts:
+                raise MaterialResolutionError("material path contains parent traversal")
+            if path.is_absolute():
+                found = [checked(path)] if path.exists() else []
+            else:
+                exact = [base / path for base in [settings_data_dir, settings_data_dir.parent] + roots]
+                found = [checked(value) for value in exact if value.exists()]
+                if len(path.parts) == 1:
+                    found.extend(checked(value) for root in roots if root.exists()
+                                 for value in root.rglob(path.name))
+            found = list(dict.fromkeys(found))
+            if not found:
+                raise MaterialResolutionError(f"declared material not found: {path.name}")
+            if len(found) != 1:
+                raise MaterialResolutionError(f"ambiguous declared material: {path.name}")
+            value = found[0]
+            if value.is_dir():
+                candidates.extend(checked(pdf) for pdf in list_pdfs(value))
+            elif value.is_file() and value.suffix.lower() == ".pdf":
+                candidates.append(value)
+            else:
+                raise MaterialResolutionError(f"declared material is not a PDF or directory: {path.name}")
+    names: dict[str, Path] = {}
     unique: list[Path] = []
     for path in candidates:
-        if path.name not in seen:
-            seen.add(path.name)
-            unique.append(path)
+        key = path.name.lower()
+        if key in names:
+            if names[key] != path:
+                raise MaterialResolutionError(f"ambiguous PDF filename: {path.name}")
+            continue
+        names[key] = path
+        unique.append(path)
     return unique

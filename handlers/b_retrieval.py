@@ -8,10 +8,15 @@ positives are explicitly discouraged because the contest penalises them.
 
 from __future__ import annotations
 
+import logging
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.config import Settings
+from core.budget import Deadline
+from core.config import Settings, case_budget_seconds
+from core.execution import check_active
 from core.llm import ModelClient
 from core.paperlib import (
     MaterialRecord,
@@ -20,22 +25,43 @@ from core.paperlib import (
     evidence_excerpt,
     index_materials,
     resolve_materials,
-    terms,
 )
 from handlers.base import HandlerError, constraints_text, extract_json_object, question_text
-from tools import pdf_probe
 
 SYSTEM = (
     "你是文献检索助手。只能使用候选论文列表中的完整文件名，不能编造文件名或论文。"
     "只输出一个 JSON 对象，不要加代码围栏。"
 )
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetrievalLimits:
+    """Operational budgets, not a requirement to return a fixed number of hits."""
+
+    candidates: int = 80
+    batch_size: int = 16
+    batches: int = 5
+    results: int = 80
+    excerpt_chars: int = 1400
+
+    @classmethod
+    def from_env(cls) -> "RetrievalLimits":
+        defaults = cls()
+        values = {}
+        for field in ("candidates", "batch_size", "batches", "results", "excerpt_chars"):
+            value = int(os.environ.get("CONTEST_B_" + field.upper(), getattr(defaults, field)))
+            if value <= 0:
+                raise ValueError("CONTEST_B_" + field.upper() + " must be positive")
+            values[field] = value
+        return cls(**values)
 
 
 def _has_cjk(text: str) -> bool:
     return any("一" <= char <= "鿿" for char in text)
 
 
-def _expand_query(client: ModelClient, query: str) -> list[str]:
+def _expand_query(client: ModelClient, query: str, deadline: Deadline, timeout: float) -> list[str]:
     """Translate a Chinese search request into English keywords.
 
     The local paper library is often English while the contest query is Chinese.
@@ -59,123 +85,141 @@ def _expand_query(client: ModelClient, query: str) -> list[str]:
             ],
             temperature=0.1,
             max_tokens=400,
+            timeout=deadline.timeout(timeout, label="query expansion"),
         )
         data = extract_json_object(text)
         values = data.get("keywords")
         if isinstance(values, list):
             return [str(item).strip() for item in values if str(item).strip()]
     except Exception:
+        check_active()
         return []
     return []
 
 
-STOP_TERMS = {
-    "paper", "papers", "study", "studies", "research", "method", "methods",
-    "approach", "approaches", "data", "dataset", "datasets", "result", "results",
-    "using", "based", "model", "models", "analysis", "review", "propose",
-    "proposed", "work", "works", "article", "articles",
-}
+def _looks_like_pdf(path: Path) -> bool:
+    check_active()
+    try:
+        with path.open("rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
 
 
-def _matched_terms(search_text: str, record: MaterialRecord) -> set[str]:
-    query_terms = set(terms(search_text))
-    paper_terms = set(terms(record.title + " " + record.abstract + " " + record.text))
-    return (query_terms & paper_terms) - STOP_TERMS
+def _rank_records(query: str, records: list[MaterialRecord]) -> list[tuple[MaterialRecord, float]]:
+    """Fuse document and best-passage ranks after deduplicating at paper level."""
+    check_active()
+    papers = [Paper(path=item.path, filename=item.filename, text=item.text) for item in records]
+    document_ranks = bm25_rank(query, papers, top_k=len(papers))
+    passages = []
+    for record in records:
+        check_active()
+        for passage in getattr(record, "passages", ()):
+            passages.append(Paper(path=record.path, filename=record.filename, text=passage.text))
+    passage_ranks = bm25_rank(query, passages, top_k=len(passages)) if passages else []
+    check_active()
+    # One paper contributes once to each ranking; repeated chunks cannot fill
+    # the candidate pool. RRF avoids comparing scores across different lengths.
+    scores: dict[str, float] = {}
+    for ranking in (document_ranks, passage_ranks):
+        seen = set()
+        for paper, value in ranking:
+            key = paper.filename.casefold()
+            if value <= 0 or key in seen:
+                continue
+            seen.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (60 + len(seen))
+    return sorted(
+        ((record, scores.get(record.filename.casefold(), 0.0)) for record in records),
+        key=lambda item: (-item[1], item[0].filename.casefold(), item[0].filename),
+    )
 
 
 class RetrievalHandler:
     def handle(self, question: dict[str, Any], settings: Settings, client: ModelClient) -> dict[str, Any]:
         case_id = question["case_id"]
+        deadline = Deadline(case_budget_seconds("Literature_Retrieval", settings))
+        limits = RetrievalLimits.from_env()
         query = question_text(question)
-        paths = resolve_materials(question.get("materials"), settings.data_dir)
+        paths = resolve_materials(question.get("materials"), settings.data_dir, allow_library=True)
         if not paths:
             return {"case_id": case_id, "papers": []}
         # Do not trust extensions: keep only files that actually look like PDFs.
-        paths = [Path(str(item["path"])) for item in (pdf_probe(str(path)) for path in paths) if item["looks_like_pdf"]]
+        paths = [path for path in paths if _looks_like_pdf(path)]
         if not paths:
             return {"case_id": case_id, "papers": []}
-        paths = paths[:20]
-
-        records = index_materials(paths, max_pages=6)
-        papers = [Paper(path=record.path, filename=record.filename, text=record.text) for record in records]
+        records = index_materials(paths, deadline=deadline)
+        records = [record for record in records if record.text.strip()]
         search_text = query
-        expanded = False
         if _has_cjk(query):
-            keywords = _expand_query(client, query)
+            keywords = _expand_query(client, query, deadline, settings.request_timeout)
             if keywords:
                 search_text = query + " " + " ".join(keywords)
-                expanded = True
-        candidates = bm25_rank(search_text, papers, top_k=15)
-        by_name = {record.filename: record for record in records}
-        candidate_names = {paper.filename for paper, _ in candidates}
-        listing = []
-        for index, (paper, value) in enumerate(candidates, start=1):
-            record = by_name[paper.filename]
-            excerpt = evidence_excerpt(paper, query=search_text, max_chars=1000).replace("\n", " ")
-            listing.append(
-                f"{index}. {paper.filename}（BM25={value:.2f}）\n"
-                f"   标题：{record.title}\n"
-                f"   证据摘录：{excerpt or '（无可提取正文）'}"
-            )
+        ranked = _rank_records(search_text, records)
+        capacity = min(limits.candidates, limits.batch_size * limits.batches)
+        candidates = ranked[:capacity]
+        if len(ranked) > capacity:
+            LOGGER.warning("B candidate budget: evaluating %d of %d papers", capacity, len(ranked))
         extra = constraints_text(question)
-        prompt = (
+        prompt_prefix = (
             f"检索需求：{query}\n\n"
             f"额外约束：\n{extra or '（无）'}\n\n"
             "候选论文（只能从这里选，filename 必须逐字一致）：\n"
-            + "\n".join(listing)
-            + "\n\n请按相关性从高到低排序，最多返回 5 篇。判定规则：\n"
+        )
+        prompt_suffix = (
+            "\n\n请按相关性从高到低返回本批所有有证据支持且符合约束的论文；没有则返回空数组，"
+            "不要求凑够篇数，也没有固定5篇限制。判定规则：\n"
             "1. 每篇必须覆盖检索需求中的至少两个具体要素（主题、方法、数据、任务或结论）；\n"
             "2. 只共享 paper/study/method 这类泛词、没有实质主题重合的论文不要返回；\n"
             "3. 误报会按每篇扣分，漏掉真正相关的论文也会扣分；不确定时保留覆盖多个要素的论文；\n"
-            "4. reason 要具体说明覆盖了哪些检索要素，不能只写“相关”。\n"
+            "4. 必须满足排除条件、时间范围、数据集和任务等硬约束；相关主题但违反约束也不要返回；\n"
+            "5. reason 要具体说明覆盖了哪些检索要素和原文依据，不能只写“相关”。\n"
             "只输出 JSON：{\"papers\":[{\"filename\":\"...\",\"reason\":\"...\"}]}。"
         )
-        try:
-            text = client.complete(
-                [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=2000,
-            )
-            data = extract_json_object(text)
-            raw_hits = data.get("papers")
-            if not isinstance(raw_hits, list):
-                raise HandlerError("papers is not a list")
-        except Exception:
-            raw_hits = []
-
         hits: list[dict[str, str]] = []
         seen: set[str] = set()
-        for item in raw_hits:
-            if not isinstance(item, dict):
-                continue
-            filename = str(item.get("filename", "")).strip()
-            reason = str(item.get("reason", "")).strip()
-            if filename not in candidate_names or filename in seen or len(reason) < 12:
-                continue
-            record = by_name.get(filename)
-            if record is None or (expanded and not _matched_terms(search_text, record)):
-                # With query expansion, a filename with no shared content term
-                # is a likely false positive; without expansion the LLM rerank
-                # is the only cross-language signal, so keep its choice.
-                continue
-            seen.add(filename)
-            hits.append({"filename": filename, "reason": reason})
-            if len(hits) >= 5:
+        for offset in range(0, len(candidates), limits.batch_size):
+            check_active()
+            if deadline.remaining() < 2:
+                LOGGER.warning("B rerank stopped at deadline after %d candidates", offset)
                 break
-
-        if not hits:
-            # Honest deterministic fallback: keep only papers with multiple
-            # distinct query-term hits, not a single generic word.
-            for paper, value in candidates:
-                if value <= 0:
+            batch = candidates[offset:offset + limits.batch_size]
+            names = {record.filename for record, _ in batch}
+            listing = []
+            for index, (record, value) in enumerate(batch, start=1):
+                excerpt = evidence_excerpt(record, query=search_text, max_chars=limits.excerpt_chars)
+                listing.append(f"{index}. {record.filename}（RRF={value:.4f}）\n证据摘录：{excerpt}")
+            try:
+                text = client.complete(
+                    [{"role": "system", "content": SYSTEM},
+                     {"role": "user", "content": prompt_prefix + "\n".join(listing) + prompt_suffix}],
+                    temperature=0.1,
+                    max_tokens=min(6000, max(2000, len(batch) * 240)),
+                    timeout=deadline.timeout(settings.request_timeout, label="retrieval rerank"),
+                )
+                raw_hits = extract_json_object(text).get("papers")
+                if not isinstance(raw_hits, list):
+                    raise HandlerError("papers is not a list")
+            except Exception as exc:
+                check_active()
+                LOGGER.warning("B rerank batch failed (%s); retaining verified earlier batches", type(exc).__name__)
+                raw_hits = []
+            # A successful empty list is a genuine rejection. Never replace it
+            # with keyword matches, and never require shared tokens to accept
+            # a model's valid cross-language / synonymous relevance judgement.
+            for item in raw_hits:
+                if not isinstance(item, dict):
                     continue
-                record = by_name[paper.filename]
-                matched = _matched_terms(search_text, record)
-                if len(matched) < 2:
+                filename = str(item.get("filename", "")).strip()
+                reason = str(item.get("reason", "")).strip()
+                key = filename.casefold()
+                if filename not in names or key in seen or len(reason) < 12:
                     continue
-                reason = "标题/摘要/正文同时命中检索要素：" + "、".join(sorted(matched)[:8])
-                hits.append({"filename": paper.filename, "reason": reason})
-                if len(hits) >= 5:
+                seen.add(key)
+                hits.append({"filename": filename, "reason": reason})
+                if len(hits) >= limits.results:
                     break
-
+            if len(hits) >= limits.results:
+                LOGGER.warning("B output budget reached: %d papers", limits.results)
+                break
         return {"case_id": case_id, "papers": hits}

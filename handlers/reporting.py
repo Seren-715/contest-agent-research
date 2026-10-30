@@ -21,13 +21,119 @@ from pathlib import Path
 from typing import Any
 
 from core.config import Settings
+from core.budget import Deadline
 from core.io import write_report
-from core.paperlib import Paper, MaterialRecord, evidence_excerpt, index_materials
+from core.execution import check_active
+from core.paperlib import Paper, MaterialRecord, evidence_excerpt, index_materials, terms
 from core.schemas import report_limit_errors
 from handlers.base import HandlerError, strip_fences
 from handlers.evidence import AuditReport, audit_report, ensure_coverage
 
 REFERENCE_MARKER = "## 参考文献"
+
+# These labels select source passages; they do not assert extracted facts or
+# treat keyword matches as entailment. Missing labels stay explicitly unknown.
+SURVEY_FACETS = (
+    ("研究问题", r"problem|task|aim|question|challenge|研究问题|任务|目标"),
+    ("方法", r"method|propos|framework|algorithm|architecture|方法|提出|算法|架构"),
+    ("数据与条件", r"dataset|benchmark|corpus|sample|participant|数据|样本|条件"),
+    ("评价指标", r"metric|accuracy|recall|precision|latency|throughput|指标|准确率|吞吐|时延"),
+    ("结果与比较", r"result|outperform|improv|baseline|percent|结果|提升|比较|基线|%"),
+    ("局限与边界", r"limitation|future work|threat|constraint|局限|限制|未来工作|边界"),
+)
+
+
+def survey_evidence_matrix(
+    records: list[MaterialRecord], *, query: str = "", max_total_chars: int = 36000,
+) -> str:
+    """Build a fair, bounded per-paper matrix of verbatim candidate passages.
+
+    Offsets refer to the original pypdf page text, not flattened prompt text.
+    There is deliberately no model-generated fact or confidence in this layer.
+    """
+    if not records:
+        return ""
+    headers = [f"[{i}] 完整文件名：{r.filename}\n内容哈希：{r.sha256}\n"
+               for i, r in enumerate(records, 1)]
+    available = max_total_chars - sum(len(header) for header in headers) - 2 * len(records)
+    per_paper = min(6000, available // len(records))
+    if per_paper < 600:
+        raise HandlerError("survey evidence budget cannot cover all specified papers")
+    query_terms = set(terms(query))
+    blocks: list[str] = []
+    for header, record in zip(headers, records):
+        check_active()
+        passages = list(getattr(record, "passages", ()))
+        candidates = [(p.page, p.start, p.end, p.text) for p in passages if p.text.strip()]
+        if not candidates and record.text.strip():
+            # Compatibility for in-memory records: never invent a page locator.
+            candidates = [(None, 0, len(record.text), record.text)]
+        selected: dict[tuple[int, int], list[str]] = {}
+        missing: list[str] = []
+        for label, pattern in SURVEY_FACETS:
+            ranked = []
+            for position, (_, _, _, text) in enumerate(candidates):
+                matches = list(re.finditer(pattern, text, re.IGNORECASE))
+                if not matches:
+                    continue
+                overlap = len(query_terms & set(terms(text)))
+                heading = bool(re.search(r"(?:^|\n)\s*(?:\d+[.\s]*)?(?:" + pattern + r")", text, re.IGNORECASE))
+                numeric = bool(re.search(r"\d+(?:\.\d+)?\s*(?:%|percent|ms|seconds|accuracy)", text, re.IGNORECASE))
+                score = min(overlap, 4) + 4 * heading + 2 * numeric + min(len(matches), 3)
+                ranked.append((score, position, matches[0].start()))
+            if ranked:
+                used_locations: list[tuple[object, int]] = []
+                for _, position, match_start in sorted(ranked, key=lambda item: (-item[0], item[1])):
+                    page, start, _, _ = candidates[position]
+                    # Overlapping chunks from one page cannot occupy both
+                    # evidence slots while another page supplies a result.
+                    if any(page == seen_page and abs(start - seen_start) < 800
+                           for seen_page, seen_start in used_locations):
+                        continue
+                    selected.setdefault((position, match_start), []).append(label)
+                    used_locations.append((page, start))
+                    if len(used_locations) == 2:
+                        break
+            else:
+                missing.append(label)
+        # Preserve some source context even when all facet expressions miss.
+        if candidates and not selected:
+            position = max(range(len(candidates)),
+                           key=lambda i: len(query_terms & set(terms(candidates[i][3]))))
+            selected[(position, 0)] = ["任务相关上下文"]
+        notes = "未定位维度：" + "、".join(missing) + "；未定位不等于论文未报告。\n" if missing else ""
+        warnings = getattr(record, "warnings", ())
+        if warnings:
+            notes += "解析限制：" + "；".join(warnings)[:400] + "\n"
+        # Reserve notes first, then divide the remainder between facets. Long
+        # abstracts cannot consume the budget belonging to result/limit pages.
+        quote_budget = max(0, per_paper - len(notes) - 100 * len(selected))
+        each = min(1200, quote_budget // max(1, len(selected)))
+        if selected and each < 80:
+            raise HandlerError("survey evidence budget cannot retain located source passages for all papers")
+        lines: list[str] = []
+        for (position, match_start), labels in selected.items():
+            page, start, _, raw = candidates[position]
+            quote_start = max(0, min(match_start - each // 3, len(raw) - each))
+            quote = raw[quote_start:quote_start + each]
+            source_start = start + quote_start
+            locator = f"PDF页{page}，原文字符[{source_start}:{source_start + len(quote)}]" if page is not None else "页码未定位"
+            lines.append(f"候选维度={'/'.join(labels)}；{locator}\n原文：{quote}")
+        block = header + notes + "\n".join(lines)
+        if not candidates:
+            block += "无法提取正文；不得推断该论文的具体方法、数值或结论。"
+        blocks.append(block)
+    result = "\n\n".join(blocks)
+    if len(result) > max_total_chars:
+        raise HandlerError("survey evidence matrix exceeded its configured budget")
+    return result
+
+
+def survey_materials_bundle(
+    paths: list[Path], *, query: str = "", deadline: Deadline | None = None,
+) -> tuple[str, list[MaterialRecord]]:
+    records = index_materials(paths, deadline=deadline)
+    return survey_evidence_matrix(records, query=query), records
 
 
 def materials_bundle(
@@ -37,7 +143,7 @@ def materials_bundle(
     max_chars: int = 1500,
 ) -> tuple[str, list[MaterialRecord]]:
     """Return the prompt block plus indexed records for the evidence gate."""
-    records = index_materials(paths, max_pages=12)
+    records = index_materials(paths, max_pages=12, max_chars=48000, page_selection="head_tail")
     blocks: list[str] = []
     for index, record in enumerate(records, start=1):
         paper = Paper(path=record.path, filename=record.filename, text=record.text)
@@ -95,7 +201,7 @@ def finalize(
 ) -> dict[str, Any]:
     markdown = strip_fences(markdown).strip() + "\n"
     if records is None:
-        records = index_materials(paths, max_pages=12)
+        records = index_materials(paths)
     if function == "Survey":
         markdown, _ = ensure_coverage(markdown, records, function)
     report = audit_report(markdown, records, function)
