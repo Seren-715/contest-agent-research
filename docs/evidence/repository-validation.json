@@ -1,0 +1,16 @@
+{
+  "date": "2026-10-30",
+  "scope": "new independent repository; no original credentials, private drafts or reference algorithms",
+  "python": "3.9.25",
+  "command": "python -m pytest -o addopts= -q -ra",
+  "passed": 144,
+  "skipped": 3,
+  "failures": 0,
+  "skip_reasons": [
+    "one reference algorithm case needs vendor/reference, intentionally absent",
+    "two complete real-output replay cases need local private diagnostic drafts, intentionally not uploaded"
+  ],
+  "deterministic_excerpt_regressions_included": true,
+  "formal_platform_evaluation_performed": false,
+  "paid_model_calls_on_publication": 0
+}

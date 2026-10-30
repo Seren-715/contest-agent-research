@@ -1,0 +1,62 @@
+{
+  "organized_on": "2026-10-30",
+  "live_platform_deployment_verified": false,
+  "files": [
+    {
+      "file": "competition-rules-2026-10-21-snapshot.md",
+      "bytes": 9468,
+      "sha256": "6eba42de646959194a7dda7044c39dc77383bbfb4b004113d4f7b4bec3a4e06a",
+      "public_source": "http://8.149.132.48/api/v1/challenges/challenge-tbd/competition-rules",
+      "provenance": "local contest-material snapshot; supplied or acquired earlier, not refetched on publication",
+      "historical_only": true
+    },
+    {
+      "file": "dispatch.example.json",
+      "bytes": 1620,
+      "sha256": "9422549f88c88595b769660b4b769afc8580db3594d15bc7ba2a2ae6c8f5d072",
+      "public_source": null,
+      "provenance": "local contest-material snapshot; supplied or acquired earlier, not refetched on publication",
+      "historical_only": false
+    },
+    {
+      "file": "dispatch.json示例与读取说明.md",
+      "bytes": 2140,
+      "sha256": "cf67647a5a94c62e88a8198eeb2c34e2a3e82c4254e3d8fc9fde8f29a0d53365",
+      "public_source": null,
+      "provenance": "local contest-material snapshot; supplied or acquired earlier, not refetched on publication",
+      "historical_only": false
+    },
+    {
+      "file": "d类通告.md",
+      "bytes": 4002,
+      "sha256": "4f4db36155a5ae26659bc68dac2fd29fef785a7071b9b5ccd31efb4d032d75d5",
+      "public_source": null,
+      "provenance": "local contest-material snapshot; supplied or acquired earlier, not refetched on publication",
+      "historical_only": false
+    },
+    {
+      "file": "research-agent-spec.md",
+      "bytes": 32975,
+      "sha256": "604da02e3f27fa521bfc3f20223cd5c3fc65c34e17262b18ca3963de2ade8525",
+      "public_source": "http://8.149.132.48/api/v1/challenges/challenge-tbd/materials/research-agent-spec",
+      "provenance": "local contest-material snapshot; supplied or acquired earlier, not refetched on publication",
+      "historical_only": false
+    },
+    {
+      "file": "research-description.md",
+      "bytes": 31816,
+      "sha256": "c286490faf88c824c97bd463d69a866f5c5add6b15adc116cd488a226dec52dd",
+      "public_source": "http://8.149.132.48/api/v1/challenges/challenge-tbd/materials/research-description",
+      "provenance": "local contest-material snapshot; supplied or acquired earlier, not refetched on publication",
+      "historical_only": false
+    },
+    {
+      "file": "research-scoring-rules.md",
+      "bytes": 20484,
+      "sha256": "3ff49054ac37d9f9aad435b7c1bdecad05dba45d4ee3ce57f84702eba7fb5b07",
+      "public_source": "http://8.149.132.48/api/v1/challenges/challenge-tbd/materials/research-scoring-rules",
+      "provenance": "local contest-material snapshot; supplied or acquired earlier, not refetched on publication",
+      "historical_only": false
+    }
+  ]
+}

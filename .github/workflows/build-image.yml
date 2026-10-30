@@ -1,0 +1,148 @@
+name: build-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version, e.g. 1.5.0"
+        required: false
+        default: "1.5.0"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.9"
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: uv run pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$VERSION" ]; then
+            VERSION="dev"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Load AgentHack base image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # If the organizer publishes the image publicly, this is enough.
+          docker pull agenthack/base:1.1.1 || true
+          if ! docker image inspect agenthack/base:1.1.1 >/dev/null 2>&1; then
+            # Private one-time cache: a release tagged `base-image`.
+            gh release download base-image \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern agenthack-base-1.1.1.tar \
+              --dir /tmp --clobber || true
+            if [ -f /tmp/agenthack-base-1.1.1.tar ]; then
+              docker load -i /tmp/agenthack-base-1.1.1.tar
+            fi
+          fi
+          if ! docker image inspect agenthack/base:1.1.1 >/dev/null 2>&1; then
+            echo "::error::agenthack/base:1.1.1 is unavailable. Publish it once as a private release tagged 'base-image' (see docs/CI.md)."
+            exit 1
+          fi
+          docker image inspect agenthack/base:1.1.1 --format '{{.Id}} {{.Size}}'
+
+      - name: Create keyless agent config
+        run: |
+          # The contest image must not contain a real API key. The platform
+          # injects PLATFORM_LLM_URL / PLATFORM_API_KEY / AGENT_MODEL_NAME.
+          printf '{"base_url":"","api_key":"","model":"dsv4"}\n' > agent_config.json
+
+      - name: Build image
+        env:
+          TEAM_ID: ${{ vars.TEAM_ID || '拿了国一她就会回来对不队' }}
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg "TEAM_ID=${TEAM_ID}" \
+            --build-arg "AGENT_VERSION=${VERSION}" \
+            -t "contest-agent:${VERSION}" .
+
+      - name: Smoke test /health
+        run: |
+          docker rm -f contest-ci-smoke >/dev/null 2>&1 || true
+          docker run -d --name contest-ci-smoke --platform linux/amd64 \
+            -p 8080:8080 \
+            -e CONTEST_MOCK_LLM=1 \
+            -e CONTEST_TEAM=ci \
+            -e TEAM_ID=ci \
+            -e AGENTHACK_TELEMETRY_REQUIRED=false \
+            "contest-agent:${VERSION}"
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health; then ok=1; break; fi
+            sleep 1
+          done
+          docker rm -f contest-ci-smoke >/dev/null 2>&1 || true
+          if [ "$ok" != "1" ]; then
+            echo "::error::/health did not become ready"
+            exit 1
+          fi
+
+      - name: Export tar and hash
+        run: |
+          docker save "contest-agent:${VERSION}" -o "contest-agent-${VERSION}.tar"
+          sha256sum "contest-agent-${VERSION}.tar" | tee "contest-agent-${VERSION}.tar.sha256"
+          ls -lh "contest-agent-${VERSION}.tar"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contest-agent-${{ steps.version.outputs.version }}
+          path: |
+            contest-agent-${{ steps.version.outputs.version }}.tar
+            contest-agent-${{ steps.version.outputs.version }}.tar.sha256
+          retention-days: 14
+
+      - name: Publish release asset on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" \
+              "contest-agent-${VERSION}.tar" \
+              "contest-agent-${VERSION}.tar.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              "contest-agent-${VERSION}.tar" \
+              "contest-agent-${VERSION}.tar.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "contest-agent ${VERSION}" \
+              --notes "Keyless contest image. Upload the tar to the contest console; the platform injects the model gateway URL/key/model. No API key is baked into this image."
+          fi
+
+      - name: Summary
+        run: |
+          echo "### contest-agent ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- image: \`contest-agent:${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- artifact: \`contest-agent-${VERSION}.tar\` (14 days)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- sha256: $(cut -d' ' -f1 "contest-agent-${VERSION}.tar.sha256")" >> "$GITHUB_STEP_SUMMARY"
+          echo "- keyless: platform injects PLATFORM_LLM_URL / PLATFORM_API_KEY / AGENT_MODEL_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "- next: upload the tar to the contest console → 赛题一 → 更换镜像" >> "$GITHUB_STEP_SUMMARY"

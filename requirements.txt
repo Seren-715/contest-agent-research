@@ -1,0 +1,6 @@
+# The base image already provides the AgentHack SDK, openai 1.35, httpx 0.27,
+# fastapi and pydantic 2.8. pypdf is the only extra runtime dependency; the
+# Dockerfile copies the pure-Python package from vendor/python (pypdf 5.9.0)
+# so the image builds without PyPI access. Keep this list in sync for local
+# `pip install -r` use.
+pypdf>=5,<6

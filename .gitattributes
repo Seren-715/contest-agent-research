@@ -1,0 +1,2 @@
+# Preserve organizer-provided snapshot bytes and manifest digests across OSes.
+docs/contest/2026-10-30/** -text

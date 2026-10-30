@@ -1,0 +1,24 @@
+{
+  "source": "user-supplied platform screenshot transcribed 2026-10-30; personal screenshot information excluded",
+  "completed_cases": 11,
+  "total_cases": 11,
+  "automatic_score": 59.4,
+  "automatic_score_max": 100,
+  "agent_tokens": 61127,
+  "expert_review": "pending",
+  "test_evaluation_only": true,
+  "public_leaderboard_included": false,
+  "evaluation_id": null,
+  "submitted_image_verified": false,
+  "items": {
+    "chat": {"score": 5, "max": 5},
+    "retrieval": {"score": 0.8, "max": 15},
+    "survey_facts": {"score": 0, "max": 15},
+    "citations": {"score": 7.8, "max": 10},
+    "idea": {"score": 10.3, "max": 15},
+    "experiment_pipeline": {"score": 17.6, "max": 20},
+    "data_figures": {"score": 18, "max": 20}
+  },
+  "rounding_note": "Displayed components rounded; do not replace platform total with their rounded sum.",
+  "claim_limit": "No platform answers, hidden gold labels or official judge evidence were provided."
+}

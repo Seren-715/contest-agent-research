@@ -1,0 +1,1 @@
+"""Contest agent HTTP service."""

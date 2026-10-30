@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local run artifacts
+data/
+output/
+runs/
+*.log
+
+# Secrets / personal files
+.env
+.env.*
+!.env.example
+*.pdf
+*.docx
+*.zip
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Platform D-class material is committed as a public package; local reference
+# implementations are not.
+# Official image secrets and exports
+agent_config.json
+*.tar
+
+# Local-only D references (never shipped)
+vendor/reference/

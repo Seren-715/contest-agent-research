@@ -1,0 +1,1 @@
+"""Shared contest-agent core."""

@@ -1,0 +1,15 @@
+{
+  "case_id": "D-02",
+  "protocol_version": "layered-d-v3",
+  "files": {
+    "artifacts.py": "a1356f56b78f67dec74f052770b2dea56ee2a92b995988170363ba55db90c9b3",
+    "experiment.agent.json": "f9f21f2dd9f21098c5dc95d03971345d2ea5726527becc2d9bc22f1a8589fea3",
+    "experiment.py": "fb903c9da32e4e81623a1d05fbf7fccebf6dcb1f105daeb2887b8ac61ee05bf1",
+    "font.py": "667c81973c1ebf2f96d14b30423bb764518341c23f19efe34215bc10b4611782",
+    "implementation.py": "3b2188faa77c4fbdbf0346dfe7757c013cd62dec11bcd2a0dd3994457e071537",
+    "method.md": "86d56abd424be51cddbe43a1cd8ebddf05b2621622669e23c573cdb3afbf06ef",
+    "protocol.json": "a2d34db5bc7f4be1d67383d7ea9c485489f3f3d4819a4976c11908713acc9cfe",
+    "sample.json": "77d6816b8c434b3fe3dec60d486bdb2a7b284b3b60cb7fdf0e6423d2a9982cde",
+    "worker.py": "0ff2a5606a07501bdc1019046fe3f0c0b309bd245f6744da20c8675686d24403"
+  }
+}

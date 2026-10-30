@@ -1,0 +1,15 @@
+{
+  "file": "contest-agent-1.5.5-real-debug.tar",
+  "bytes": 176252928,
+  "sha256": "528bf9b9dddd6ac9bef801e4e4249bdea258ee6d2faedd99519e8f1105832374",
+  "image": "contest-agent:1.5.5-real-debug",
+  "image_id": "sha256:5a1f93c9f80febbe6ea9b0bf1430fa3781442539ace675986d1b3c6567299910",
+  "source_revision": "5937be21d7f4f6a9d8c78b513c31a4c767e3a133",
+  "platform": "linux/amd64",
+  "user": "agent",
+  "port": "8080/tcp",
+  "layers_inspected": 55,
+  "all_image_configs_keyless": true,
+  "smoke": "real SDK 1.1.1 / Python 3.11.16 with synthetic loopback gateway",
+  "formal_platform_evaluation": false
+}
