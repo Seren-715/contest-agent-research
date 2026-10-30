@@ -133,8 +133,9 @@ class ModelClient:
         *,
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> str:
-        body = self.complete_raw(messages, temperature=temperature, max_tokens=max_tokens)
+        body = self.complete_raw(messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
         choices = body.get("choices") or []
         if not choices:
             raise ModelError(f"model response has no choices: {body}")

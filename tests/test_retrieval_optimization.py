@@ -166,3 +166,22 @@ def test_filename_match_without_readable_evidence_is_not_returned(settings, monk
             pytest.fail("unread PDF must not become an evidence candidate")
     result = RetrievalHandler().handle({"case_id": "B-01", "input": "QuarrySpec"}, settings, MustNotCall())
     assert result["papers"] == []
+
+
+def test_real_model_client_accepts_and_forwards_retrieval_timeouts(settings, tmp_path, monkeypatch):
+    from core.llm import ModelClient
+    _corpus(monkeypatch, tmp_path, count=2)
+    timeouts = []
+    def raw(self, messages, *, timeout=None, **kwargs):
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            content = '{"keywords":["adaptive","decoding","inference"]}'
+        else:
+            content = '{"papers":[{"filename":"paper_00.pdf","reason":"原文提出自适应解码并比较语言推理吞吐量。"}]}'
+        return {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+    monkeypatch.setattr(ModelClient, "complete_raw", raw)
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "自适应解码推理吞吐量"},
+                                       settings, ModelClient(None, None, None))
+    assert len(result["papers"]) == 1
+    assert len(timeouts) == 2
+    assert all(0 < timeout <= settings.request_timeout for timeout in timeouts)
