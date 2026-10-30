@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from core.budget import Deadline
+from core.diagnostics import record_stage
 from core.config import Settings, case_budget_seconds
 from core.execution import check_active
 from core.llm import ModelClient, ModelError
@@ -42,10 +43,13 @@ class SurveyHandler:
         deadline = Deadline(case_budget_seconds("Survey", settings))
         case_id = question["case_id"]
         query = question_text(question)
+        record_stage(settings, case_id, "material_resolution")
         paths = resolve_materials(question.get("materials"), settings.data_dir)
         if not paths:
             raise HandlerError("survey materials are missing: no PDFs resolved")
+        record_stage(settings, case_id, "evidence_matrix", material_count=len(paths))
         block, records = materials_bundle(paths, query=query, deadline=deadline)
+        record_stage(settings, case_id, "evidence_ready", record_count=len(records), evidence_chars=len(block))
         extra = constraints_text(question)
         base_prompt = (
             f"综述任务：{query}\n\n"
@@ -76,6 +80,7 @@ class SurveyHandler:
             bounded = replace(client, timeout=min(client.timeout, timeout)) if isinstance(client, ModelClient) else client
             return bounded.complete(messages, temperature=temperature, max_tokens=6000)
 
+        record_stage(settings, case_id, "model_generation")
         text = complete(
             [{"role": "system", "content": SYSTEM}, {"role": "user", "content": base_prompt}],
             0.25,

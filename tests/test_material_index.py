@@ -153,3 +153,29 @@ def test_whole_library_does_not_scan_unrelated_data_when_library_exists(tmp_path
     monkeypatch.setenv("DATA_PATH", str(mount))
     resolved = resolve_materials([], data, allow_library=True)
     assert {p.name for p in resolved} == {"allowed.pdf", "second.pdf"}
+
+
+@pytest.mark.parametrize("prefix", ["data/论文库", "data/papers"])
+def test_package_relative_materials_resolve_separate_readonly_mount(tmp_path, monkeypatch, prefix):
+    data = tmp_path / "output" / "data"
+    mount = tmp_path / "readonly-data"
+    source = mount / prefix.split("/")[1] / "topic" / "source.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF-")
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    assert resolve_materials([prefix + "/topic/source.pdf"], data) == [source]
+    # Full suffix must survive mapping; a basename elsewhere is no substitute.
+    with pytest.raises(MaterialResolutionError, match="not found"):
+        resolve_materials([prefix + "/wrong/source.pdf"], data)
+
+
+def test_package_relative_path_still_rejects_two_real_matches(tmp_path, monkeypatch):
+    data = tmp_path / "output" / "data"
+    mount = tmp_path / "readonly-data"
+    for base in [data, mount]:
+        source = base / "论文库" / "source.pdf"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"%PDF-")
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    with pytest.raises(MaterialResolutionError, match="ambiguous"):
+        resolve_materials(["data/论文库/source.pdf"], data)

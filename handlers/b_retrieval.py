@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from core.budget import Deadline
+from core.diagnostics import record_stage
 from core.config import Settings, case_budget_seconds
 from core.execution import check_active
 from core.llm import ModelClient
@@ -141,6 +142,7 @@ class RetrievalHandler:
         deadline = Deadline(case_budget_seconds("Literature_Retrieval", settings))
         limits = RetrievalLimits.from_env()
         query = question_text(question)
+        record_stage(settings, case_id, "material_resolution")
         paths = resolve_materials(question.get("materials"), settings.data_dir, allow_library=True)
         if not paths:
             return {"case_id": case_id, "papers": []}
@@ -150,6 +152,7 @@ class RetrievalHandler:
             return {"case_id": case_id, "papers": []}
         records = index_materials(paths, deadline=deadline)
         records = [record for record in records if record.text.strip()]
+        record_stage(settings, case_id, "evidence_ready", resolved_count=len(paths), readable_count=len(records))
         search_text = query
         if _has_cjk(query):
             keywords = _expand_query(client, query, deadline, settings.request_timeout)
@@ -190,6 +193,7 @@ class RetrievalHandler:
                 excerpt = evidence_excerpt(record, query=search_text, max_chars=limits.excerpt_chars)
                 listing.append(f"{index}. {record.filename}（RRF={value:.4f}）\n证据摘录：{excerpt}")
             try:
+                record_stage(settings, case_id, "model_rerank", candidate_count=len(batch))
                 text = client.complete(
                     [{"role": "system", "content": SYSTEM},
                      {"role": "user", "content": prompt_prefix + "\n".join(listing) + prompt_suffix}],
@@ -202,6 +206,7 @@ class RetrievalHandler:
                     raise HandlerError("papers is not a list")
             except Exception as exc:
                 check_active()
+                record_stage(settings, case_id, "model_rerank_failed", error_type=type(exc).__name__)
                 LOGGER.warning("B rerank batch failed (%s); retaining verified earlier batches", type(exc).__name__)
                 raw_hits = []
             # A successful empty list is a genuine rejection. Never replace it

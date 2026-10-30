@@ -31,9 +31,8 @@ COPY --chown=agent:agent d_adapter /app/d_adapter
 # the self-test/repair loop works even if the platform mounts only case dirs.
 COPY --chown=agent:agent vendor/d-class/公开样例请求 /app/d-class-samples/公开样例请求
 
-# The contest guide asks for the team's gateway URL/key/model to be baked into
-# the image. Runtime env vars take precedence in core/config.py. Create this
-# file from agent_config.example.json before building; never commit it.
+# The platform injects gateway credentials at runtime. This optional local
+# config must contain empty URL/key fields in the submission image.
 COPY --chown=agent:agent agent_config.json /app/agent_config.json
 
 USER agent

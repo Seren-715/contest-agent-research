@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.config import Settings, load_settings
+from core.diagnostics import record_stage
 from core.io import OutputError, check_figures, write_report, write_result
 from core.llm import ModelClient, ModelError
 from core.paperlib import MaterialResolutionError, evidence_excerpt, index_materials, resolve_materials
@@ -222,6 +223,10 @@ def solve_task(task_input: dict[str, Any], settings: Optional[Settings] = None) 
     case_id = question["case_id"]
     function = question["function"]
     handler = HANDLERS[function]
+    record_stage(settings, case_id, "start", function=function,
+                 gateway_url_configured=bool(settings.llm_base_url),
+                 gateway_key_configured=bool(settings.llm_api_key),
+                 gateway_model_configured=bool(settings.llm_model))
 
     try:
         payload = handler.handle(question, settings, model_client(settings))
@@ -230,6 +235,7 @@ def solve_task(task_input: dict[str, Any], settings: Optional[Settings] = None) 
         if function == "Reproduction":
             check_figures(settings, data.get("figures", []))
         write_result(settings, case_id, data)
+        record_stage(settings, case_id, "completed")
         # The contest judge reads the /solve response as the five-class answer
         # JSON; return it exactly. Do not add an SDK-style `answer` wrapper for
         # B/C/D/E (it would be an extra top-level field and fail the schema).
@@ -237,6 +243,8 @@ def solve_task(task_input: dict[str, Any], settings: Optional[Settings] = None) 
     except (HandlerError, MaterialResolutionError, ModelError, OutputError, DAdapterError, GenerationError, RunnerError, TimeoutError) as exc:
         if isinstance(exc, ExecutionCancelled):
             raise
+        record_stage(settings, case_id, "handler_failed", error_type=type(exc).__name__,
+                     reason=str(exc).split(":", 1)[0] if isinstance(exc, MaterialResolutionError) else "see_phase_and_error_type")
         if function == "Reproduction":
             fallback = failed_reproduction(settings, case_id)
             if fallback is not None:

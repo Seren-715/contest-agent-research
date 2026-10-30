@@ -490,7 +490,9 @@ def _paper_roots(settings_data_dir: Path) -> list[Path]:
 
 
 class MaterialResolutionError(RuntimeError):
-    pass
+    def __init__(self, message: str):
+        logging.getLogger(__name__).warning("material_resolution_failed reason=%s", message.split(":", 1)[0])
+        super().__init__(message)
 
 
 def resolve_materials(
@@ -540,6 +542,19 @@ def resolve_materials(
                 found = [checked(path)] if path.exists() else []
             else:
                 exact = [base / path for base in [settings_data_dir, settings_data_dir.parent] + roots]
+                # Questions use paths relative to the contest package, while
+                # deployment mounts its data separately from writable /output.
+                # Preserve the complete suffix; never reduce an explicit path
+                # to a basename that could select another paper.
+                if path.parts and path.parts[0] == "data" and len(path.parts) > 1:
+                    suffix = Path(*path.parts[1:])
+                    data_bases = [settings_data_dir, Path("/data")]
+                    if os.environ.get("DATA_PATH"):
+                        data_bases.append(Path(os.environ["DATA_PATH"]))
+                    exact.extend(base / suffix for base in data_bases)
+                    if suffix.parts[0] in ("论文库", "papers") and len(suffix.parts) > 1:
+                        exact.extend(root / Path(*suffix.parts[1:]) for root in roots
+                                     if root.name == suffix.parts[0])
                 found = [checked(value) for value in exact if value.exists()]
                 if len(path.parts) == 1:
                     found.extend(checked(value) for root in roots if root.exists()
