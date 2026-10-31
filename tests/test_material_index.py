@@ -338,3 +338,32 @@ def test_slow_early_file_cannot_starve_later_files_of_index_time(tmp_path, monke
     assert all(record.text.strip() for record in records)
     assert all("index_budget_exhausted" not in record.warnings for record in records)
     assert all("index_time_limit" in record.warnings for record in records)
+
+
+def test_slow_reader_setup_still_indexes_at_least_one_page(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("core.paperlib.time.monotonic", lambda: clock[0])
+    monkeypatch.setenv("CONTEST_INDEX_SECONDS", "9")
+    setup_cost = {"a.pdf": 6.0}
+
+    class Page:
+        def extract_text(self):
+            clock[0] += 1.0
+            return "Evidence text for this page of the study."
+
+    class Reader:
+        def __init__(self, path):
+            clock[0] += setup_cost.get(Path(path).name, 0.0)  # e.g. a slow xref rebuild
+            self.pages = [Page() for _ in range(10)]
+
+    monkeypatch.setattr("core.paperlib.PdfReader", Reader)
+    paths = []
+    for name in ("a.pdf", "b.pdf", "c.pdf"):
+        path = tmp_path / name
+        path.write_bytes(b"%PDF-")
+        paths.append(path)
+    records = index_materials(paths)
+    # a.pdf's setup alone exceeds its 3 s share; it must still keep page 1.
+    assert records[0].indexed_pages == (1,)
+    assert all(record.text.strip() for record in records)
+    assert clock[0] <= 9.0

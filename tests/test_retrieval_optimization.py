@@ -277,3 +277,22 @@ def test_translated_keywords_rank_independently_of_the_cjk_query():
     other = make("other.pdf", "botany observations")
     ranked = _rank_records("自适应解码", [other, relevant], ("adaptive", "decoding"))
     assert ranked[0][0].filename == "english.pdf" and ranked[0][1] > 0
+
+
+@pytest.mark.parametrize("query", [
+    "adaptive decoding language inference published after 2022",
+    "adaptive decoding language inference, only on English benchmarks",
+    "自适应解码 语言推理 2022年以后的论文",
+    "自适应解码 语言推理，仅限使用公开数据集",
+    "adaptive decoding language inference at least 7B parameters",
+])
+def test_lexical_fallback_is_refused_when_the_query_states_a_condition(settings, tmp_path, monkeypatch, query):
+    _corpus(monkeypatch, tmp_path, count=2)
+    with pytest.raises(HandlerError, match="before any valid"):
+        RetrievalHandler().handle({"case_id": "B-01", "input": query}, settings, FakeClient(["bad JSON"]))
+
+
+def test_plain_topic_words_do_not_count_as_conditions():
+    from handlers.b_retrieval import CONSTRAINT_RE
+    for query in ("非线性系统的自适应控制", "检索增强生成方法", "adaptive decoding for language inference"):
+        assert not CONSTRAINT_RE.search(query), query
