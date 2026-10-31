@@ -35,11 +35,11 @@ REFERENCE_MARKER = "## 参考文献"
 # treat keyword matches as entailment. Missing labels stay explicitly unknown.
 SURVEY_FACETS = (
     ("研究问题", r"problem|task|aim|question|challenge|研究问题|任务|目标"),
-    ("方法", r"method|propos|framework|algorithm|architecture|方法|提出|算法|架构"),
+    ("方法", r"method|propos|framework|algorithm|architecture|implementation|approach|方法|提出|算法|架构"),
     ("数据与条件", r"dataset|benchmark|corpus|sample|participant|数据|样本|条件"),
     ("评价指标", r"metric|accuracy|recall|precision|latency|throughput|指标|准确率|吞吐|时延"),
-    ("结果与比较", r"result|outperform|improv|baseline|percent|结果|提升|比较|基线|%"),
-    ("局限与边界", r"limitation|future work|threat|constraint|局限|限制|未来工作|边界"),
+    ("结果与比较", r"result|finding|conclusion|outperform|improv|baseline|percent|结果|提升|比较|基线|%"),
+    ("局限与边界", r"limitation|caveat|weakness|future work|threat|constraint|局限|限制|未来工作|边界"),
 )
 
 

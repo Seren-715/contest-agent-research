@@ -64,6 +64,14 @@ def test_semantic_selection_does_not_require_token_overlap(settings, tmp_path, m
     assert result["papers"][0]["filename"] == paths[0].name
 
 
+def test_short_specific_reason_is_not_silently_discarded(settings, tmp_path, monkeypatch):
+    paths = _corpus(monkeypatch, tmp_path, count=1)
+    client = FakeClient([json.dumps({"papers": [{"filename": paths[0].name, "reason": "研究推理解码加速"}]}, ensure_ascii=False)])
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "decoding inference"}, settings, client)
+    assert result["papers"] == [{"filename": paths[0].name, "reason": "研究推理解码加速"}]
+    validate_answer("Literature_Retrieval", result)
+
+
 def test_failed_model_with_exclusion_never_guesses_from_overlap(settings, tmp_path, monkeypatch):
     _corpus(monkeypatch, tmp_path, count=2)
     with pytest.raises(HandlerError, match="before any valid"):
@@ -135,6 +143,31 @@ def test_real_pdf_after_twentieth_with_unique_middle_page_evidence(settings):
 
     result = RetrievalHandler().handle({"case_id": "B-01", "input": "QuarrySpec adaptive decoding throughput"}, settings, EvidenceChoice())
     assert [item["filename"] for item in result["papers"]] == ["z_relevant.pdf"]
+
+
+def test_readable_pdf_with_leading_bytes_is_not_discarded(settings):
+    from fpdf import FPDF
+
+    library = settings.data_dir / "papers"
+    library.mkdir(parents=True)
+    path = library / "leading.pdf"
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=10)
+    pdf.multi_cell(0, 5, "Adaptive decoding improves language inference throughput.")
+    pdf.output(str(path))
+    path.write_bytes(b"leading bytes\n" + path.read_bytes())
+    client = FakeClient(['{"papers":[{"filename":"leading.pdf","reason":"原文研究自适应解码和语言推理吞吐量。"}]}'])
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding throughput"}, settings, client)
+    assert [item["filename"] for item in result["papers"]] == ["leading.pdf"]
+
+
+def test_invalid_pdf_headers_report_failure_instead_of_empty_results(settings):
+    library = settings.data_dir / "papers"
+    library.mkdir(parents=True)
+    (library / "broken.pdf").write_text("not a PDF", encoding="utf-8")
+    with pytest.raises(HandlerError, match="no recognizable PDFs"):
+        RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding"}, settings, FakeClient([]))
 
 
 def test_official_formula_penalizes_false_hits_and_deduplicates_case():

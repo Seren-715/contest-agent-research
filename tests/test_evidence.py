@@ -74,6 +74,41 @@ def test_ensure_coverage_adds_missing_citation_and_reference() -> None:
     assert "reference:b.pdf" in additions
 
 
+def test_survey_rejects_duplicate_or_ambiguous_reference_entries() -> None:
+    records = [_record("a.pdf", "A"), _record("b.pdf", "B")]
+    body = "研究材料分别为 A [1] 和 B [2]。"
+    for refs in ("[1] a.pdf\n[1] b.pdf\n[2] b.pdf", "[1] a.pdf b.pdf\n[2] b.pdf",
+                 "[1] a.pdf\n[2] a.pdf"):
+        markdown = _survey(body, refs)
+        assert any(f.category == "missing_reference_entry" for f in audit_report(markdown, records, "Survey").blockers)
+        fixed, _ = ensure_coverage(markdown, records, "Survey")
+        assert any(f.category == "missing_reference_entry" for f in audit_report(fixed, records, "Survey").blockers)
+
+
+def test_survey_accepts_consistent_renumbering() -> None:
+    records = [_record("a.pdf", "A"), _record("b.pdf", "B")]
+    markdown = _survey("研究材料分别为 A [2] 和 B [1]。", "[1] b.pdf\n[2] a.pdf")
+    report = audit_report(markdown, records, "Survey")
+    assert not any(f.category in ("missing_reference_entry", "missing_inline_citation") for f in report.blockers)
+    fixed, additions = ensure_coverage(markdown, records, "Survey")
+    assert not additions
+    assert fixed == markdown
+
+
+def test_survey_filename_matching_is_not_a_substring() -> None:
+    records = [_record("a.pdf", "A"), _record("ba.pdf", "B")]
+    markdown = _survey("研究材料分别为 A [1] 和 B [2]。", "[1] ba.pdf\n[2] ba.pdf")
+    assert any(f.category == "missing_reference_entry" for f in audit_report(markdown, records, "Survey").blockers)
+    markdown = _survey("研究材料分别为 A [1] 和 B [2]。", "[1] a.pdf\n[2] ba.pdf")
+    assert not any(f.category == "missing_reference_entry" for f in audit_report(markdown, records, "Survey").blockers)
+
+
+def test_survey_reference_entry_can_continue_on_next_line() -> None:
+    records = [_record("a.pdf", "A")]
+    markdown = _survey("材料为 A [1]。", "- [1] Paper title\n  a.pdf")
+    assert not any(f.category == "missing_reference_entry" for f in audit_report(markdown, records, "Survey").blockers)
+
+
 def test_bm25_rank_prefers_topically_relevant_paper() -> None:
     papers = [
         Paper(Path("urban.pdf"), "urban.pdf", "urban green space surface temperature remote sensing"),

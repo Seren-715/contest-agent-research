@@ -84,6 +84,39 @@ def citation_ids(text: str) -> list[int]:
     return [int(value) for group in CITATION_RE.findall(text or "") for value in re.findall(r"\d+", group)]
 
 
+def _reference_entries(refs: str) -> dict[int, list[str]]:
+    """Associate numbered reference entries with their continuation lines."""
+    entries: dict[int, list[str]] = {}
+    current: tuple[int, int] | None = None
+    for line in refs.splitlines():
+        match = re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?\[(\d+)\]\s*(.*)$", line)
+        if match:
+            number = int(match.group(1))
+            entries.setdefault(number, []).append(match.group(2))
+            current = (number, len(entries[number]) - 1)
+        elif current and line.strip():
+            number, position = current
+            entries[number][position] += " " + line.strip()
+    return entries
+
+
+def _reference_mapping(refs: str, records: list[MaterialRecord]) -> tuple[dict[int, str], bool]:
+    """Match unique numbered entries to whole permitted filenames, in any order."""
+    entries = _reference_entries(refs)
+    mapping: dict[int, str] = {}
+    for number, entries_for_number in entries.items():
+        if len(entries_for_number) != 1:
+            return {}, False
+        entry = entries_for_number[0]
+        names = [record.filename for record in records if re.search(
+            r"(?<![\w.\-])" + re.escape(record.filename) + r"(?![\w.\-])", entry
+        )]
+        if len(names) != 1 or names[0] in mapping.values():
+            return {}, False
+        mapping[number] = names[0]
+    return mapping, True
+
+
 STRONG_FACT_RE = re.compile(
     r"\d|%|准确率|召回率|精确率|mrr|recall|precision|f1|bm25|mae|rmse|latency|"
     r"吞吐|耗时|优于|低于|高于|提升|下降|达到|报告了|表明|发现|证明|结果显示|"
@@ -146,21 +179,21 @@ def _citation_coverage(markdown: str, records: list[MaterialRecord], function: s
     findings: list[Finding] = []
     used = set(citation_ids(body))
     if function == "Survey":
-        for index, record in enumerate(records, start=1):
-            if index not in used:
+        mapping, valid = _reference_mapping(refs, records)
+        if not valid:
+            findings.append(Finding("missing_reference_entry", "blocker",
+                                    "参考文献编号或文件名不唯一，或同一条目包含多个指定文件。"))
+        for record in records:
+            numbers = [number for number, name in mapping.items() if name == record.filename]
+            if not numbers:
+                findings.append(Finding("missing_reference_entry", "blocker",
+                                        f"参考文献没有唯一对应完整文件名：{record.filename}。"))
+            elif numbers[0] not in used:
                 findings.append(
                     Finding(
                         "missing_inline_citation",
                         "blocker",
-                        f"正文没有引用 [{index}]（{record.filename}）；综述要求逐篇引用指定材料。",
-                    )
-                )
-            if record.filename not in refs:
-                findings.append(
-                    Finding(
-                        "missing_reference_entry",
-                        "blocker",
-                        f"参考文献没有列出完整文件名：{record.filename}",
+                        f"正文没有引用 [{numbers[0]}]（{record.filename}）；综述要求逐篇引用指定材料。",
                     )
                 )
     else:
@@ -285,7 +318,22 @@ def ensure_coverage(
     additions: list[str] = []
     used = set(citation_ids(body))
     require_all = function == "Survey"
-    for index, record in enumerate(records, start=1):
+    entries = _reference_entries(refs)
+    mapping, valid = _reference_mapping(refs, records)
+    # Do not fabricate citations around ambiguous or contradictory references.
+    if require_all and not valid:
+        return text, additions
+    assigned = {name: number for number, name in mapping.items()}
+    reserved = set(entries)
+    for original_index, record in enumerate(records, start=1):
+        index = assigned.get(record.filename)
+        if index is None:
+            available = [n for n in range(1, len(records) + 1) if n not in reserved]
+            if not available:
+                continue
+            index = original_index if original_index in available else available[0]
+            reserved.add(index)
+            assigned[record.filename] = index
         need = (require_all and index not in used) or (function == "Idea" and not used and index == 1)
         if need:
             quote = _clean_quote(record.abstract or record.text)
@@ -303,8 +351,11 @@ def ensure_coverage(
             additions.append(f"inline:{record.filename}")
 
     ref_lines = [line for line in refs.splitlines() if line.strip()]
-    for index, record in enumerate(records, start=1):
-        if record.filename not in refs:
+    for record in records:
+        index = assigned.get(record.filename)
+        if index is None:
+            continue
+        if index not in entries:
             ref_lines.append(f"[{index}] {record.filename}")
             additions.append(f"reference:{record.filename}")
 

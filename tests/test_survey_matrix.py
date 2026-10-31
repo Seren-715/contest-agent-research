@@ -34,6 +34,20 @@ def test_matrix_preserves_late_results_with_exact_page_offsets():
     assert "候选维度=" in matrix
 
 
+def test_matrix_recognizes_alternative_section_headings():
+    texts = [
+        "Implementation: An adaptive policy adjusts candidates.",
+        "Evaluation: Samples come from corpus Falcon.",
+        "Findings: On Falcon the score reaches 75.2 under protocol P.",
+        "Caveats: No multilingual evaluation was performed.",
+    ]
+    record = _record([EvidencePassage(page, 0, len(text), text)
+                      for page, text in enumerate(texts, 1)])
+    matrix = survey_evidence_matrix([record], query="neural inference")
+    for text in texts:
+        assert text in matrix
+
+
 def test_matrix_budget_compacts_without_creating_new_failure():
     records = [_record([EvidencePassage(1, 0, 40, "Method and dataset results need comparison.")], f"paper{i}.pdf")
                for i in range(12)]

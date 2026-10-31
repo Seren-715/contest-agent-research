@@ -39,6 +39,36 @@ def test_shared_excerpt_bundle_indexes_middle_page_with_page_locator(paper_setti
     assert "p.10" in block and "81.2" in block
 
 
+def test_default_survey_combines_ranked_excerpt_with_results_and_limitations(paper_settings, monkeypatch):
+    from fpdf import FPDF
+    import handlers.c_survey as module
+
+    settings, paths = paper_settings
+    path = paths[0].parent / "coverage.pdf"
+    pdf = FPDF()
+    for text in (
+        "Decoding throughput background. " * 35,
+        "Method uses adaptive candidates. " * 35,
+        "Dataset contains workload Zebra. " * 35,
+        "Results: accuracy is 83.7 percent under condition Q. " * 22,
+        "Limitations: no multilingual workloads were evaluated. " * 22,
+    ):
+        pdf.add_page()
+        pdf.set_font("Helvetica", size=10)
+        pdf.multi_cell(0, 5, text)
+    pdf.output(str(path))
+    monkeypatch.delenv("CONTEST_SURVEY_EVIDENCE_MATRIX", raising=False)
+    monkeypatch.setattr(module, "finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
+    client = FakeClient(["draft"])
+    SurveyHandler().handle({"case_id": "C-coverage", "input": "decoding throughput",
+                            "materials": [str(path)]}, settings, client)
+    prompt = client.calls[0][1]["content"]
+    assert "adaptive candidates" in prompt
+    assert "83.7 percent" in prompt
+    assert "multilingual workloads" in prompt
+    assert "PDF页4" in prompt and "PDF页5" in prompt
+
+
 def test_low_matrix_budget_reduces_windows_instead_of_rejecting_report():
     records = []
     for number in range(14):

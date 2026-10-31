@@ -19,7 +19,7 @@ from core.execution import check_active
 from core.llm import ModelClient, ModelError
 from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
-from handlers.reporting import audit, finalize, materials_bundle, survey_materials_bundle
+from handlers.reporting import audit, finalize, materials_bundle, survey_materials_bundle, survey_evidence_matrix
 
 SYSTEM = (
     "你是严谨的文献综述作者，按 PaperCode 的 Gate-Honest / ClaimLedger 纪律工作："
@@ -53,7 +53,13 @@ class SurveyHandler:
         if use_matrix:
             block, records = survey_materials_bundle(paths, query=query, deadline=deadline)
         else:
-            block, records = materials_bundle(paths, query=query, max_chars=1800, deadline=deadline)
+            # Keep the original query-ranked evidence, and supplement it with
+            # diverse facet windows. Either strategy alone can miss relevant
+            # sections; both windows contain only verbatim indexed text.
+            per_paper = min(1800, max(120, 9000 // len(paths)))
+            base, records = materials_bundle(paths, query=query, max_chars=per_paper, deadline=deadline)
+            matrix = survey_evidence_matrix(records, query=query, max_total_chars=max(6000, 36000 - len(base) - 100))
+            block = base + "\n\n补充原文窗口（候选维度仅用于定位）：\n" + matrix
         record_stage(settings, case_id, "evidence_ready", record_count=len(records), evidence_chars=len(block))
         extra = constraints_text(question)
         evidence_heading = (

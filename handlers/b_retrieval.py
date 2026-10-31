@@ -102,7 +102,9 @@ def _looks_like_pdf(path: Path) -> bool:
     check_active()
     try:
         with path.open("rb") as handle:
-            return handle.read(5) == b"%PDF-"
+            # PDF readers can handle a header preceded by leading bytes; a
+            # strict byte-zero check silently discards such readable papers.
+            return b"%PDF-" in handle.read(1024)
     except OSError:
         return False
 
@@ -145,15 +147,25 @@ class RetrievalHandler:
         record_stage(settings, case_id, "material_resolution")
         paths = resolve_materials(question.get("materials"), settings.data_dir,
                                   allow_library=True, allow_descriptions=True)
+        record_stage(settings, case_id, "materials_resolved", resolved_count=len(paths))
         if not paths:
             return {"case_id": case_id, "papers": []}
         # Do not trust extensions: keep only files that actually look like PDFs.
+        resolved_count = len(paths)
         paths = [path for path in paths if _looks_like_pdf(path)]
+        record_stage(settings, case_id, "pdf_headers_checked", resolved_count=resolved_count,
+                     accepted_count=len(paths))
         if not paths:
-            return {"case_id": case_id, "papers": []}
+            raise HandlerError("retrieval materials contain no recognizable PDFs")
         records = index_materials(paths, deadline=deadline)
+        warning_counts: dict[str, int] = {}
+        for record in records:
+            for warning in record.warnings:
+                kind = warning.split(":", 1)[0]
+                warning_counts[kind] = warning_counts.get(kind, 0) + 1
         records = [record for record in records if record.text.strip()]
-        record_stage(settings, case_id, "evidence_ready", resolved_count=len(paths), readable_count=len(records))
+        record_stage(settings, case_id, "evidence_ready", resolved_count=len(paths), readable_count=len(records),
+                     warning_counts=warning_counts)
         if not records:
             raise HandlerError("retrieval materials have no extractable evidence")
         search_text = query
@@ -223,7 +235,7 @@ class RetrievalHandler:
                 filename = str(item.get("filename", "")).strip()
                 reason = str(item.get("reason", "")).strip()
                 key = filename.casefold()
-                if filename not in names or key in seen or len(reason) < 12:
+                if filename not in names or key in seen or not reason:
                     continue
                 seen.add(key)
                 hits.append({"filename": filename, "reason": reason})
