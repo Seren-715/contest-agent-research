@@ -16,7 +16,7 @@ from core.budget import Deadline
 from core.diagnostics import record_stage
 from core.config import Settings, case_budget_seconds
 from core.execution import check_active
-from core.llm import ModelClient, ModelError
+from core.llm import ModelClient, ModelError, output_budget
 from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
 from handlers.reporting import audit, finalize, materials_bundle, survey_materials_bundle, survey_evidence_matrix
@@ -138,7 +138,7 @@ class SurveyHandler:
             check_active()
             timeout = deadline.timeout(settings.request_timeout, label="survey generation")
             bounded = replace(client, timeout=min(client.timeout, timeout)) if isinstance(client, ModelClient) else client
-            return bounded.complete(messages, temperature=temperature, max_tokens=6000)
+            return bounded.complete(messages, temperature=temperature, max_tokens=output_budget())
 
         record_stage(settings, case_id, "model_generation")
         text = complete(

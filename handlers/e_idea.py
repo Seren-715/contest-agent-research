@@ -16,7 +16,7 @@ from core.config import Settings, case_budget_seconds
 from core.budget import Deadline
 from core.diagnostics import record_stage
 from core.execution import check_active
-from core.llm import ModelClient
+from core.llm import ModelClient, output_budget
 from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
 from handlers.evidence import novelty_overlap
@@ -94,7 +94,7 @@ class IdeaHandler:
             check_active()
             timeout = deadline.timeout(settings.request_timeout, label="idea generation")
             bounded = replace(client, timeout=min(client.timeout, timeout)) if isinstance(client, ModelClient) else client
-            return bounded.complete(messages, temperature=temperature, max_tokens=6000)
+            return bounded.complete(messages, temperature=temperature, max_tokens=output_budget())
         record_stage(settings, case_id, "model_generation")
         text = complete(
             messages,
