@@ -398,7 +398,11 @@ def index_materials(
                 for number in selected:
                     check_active()
                     now = time.monotonic()
-                    if now - started >= seconds or now - file_started >= file_seconds:
+                    # The per-file share starts limiting only after one page:
+                    # hashing and PdfReader setup can exceed the share on their
+                    # own, which used to leave a readable file with no text.
+                    # The overall budget is never exceeded.
+                    if now - started >= seconds or (indexed and now - file_started >= file_seconds):
                         warnings.append("index_time_limit")
                         break
                     try:
