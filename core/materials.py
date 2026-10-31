@@ -15,7 +15,7 @@ from core.config import Settings
 from core.diagnostics import record_stage
 from core.execution import check_active
 from core.io import write_json
-from core.llm import ModelClient, ModelError
+from core.llm import ModelClient, ModelError, output_budget
 from core.paperlib import (Paper, bm25_rank, describe_material_scope, evidence_excerpt,
                            index_materials, is_material_description, resolve_materials)
 from handlers.base import HandlerError, constraints_text, extract_json_object, question_text
@@ -76,7 +76,7 @@ def select_report_materials(
                           deadline.timeout(settings.request_timeout, reserve=90, label="report generation reserve"))
             text = client.complete([{"role": "system", "content": "你负责在允许论文范围内核验相关性，只输出JSON。"},
                                     {"role": "user", "content": prompt}],
-                                   temperature=0.1, max_tokens=4000, timeout=timeout)
+                                   temperature=0.1, max_tokens=output_budget(), timeout=timeout)
             hits = extract_json_object(text).get("papers")
             if not isinstance(hits, list):
                 raise HandlerError("report source selection did not return papers")

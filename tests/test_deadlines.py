@@ -191,3 +191,45 @@ def test_runner_timeout_kills_client_without_replay(settings, monkeypatch):
     with pytest.raises(runner.RunnerError, match="timed out"):
         runner.run_platform("D-01", Path("implementation.py"), settings, timeout=1)
     assert seen == ["start", "kill"]
+
+
+def _client_returning(body, seen=None):
+    from core.llm import ModelClient
+
+    class Stub(ModelClient):
+        def complete_raw(self, messages, **kwargs):
+            if seen is not None:
+                seen.append(kwargs.get("max_tokens"))
+            item = body.pop(0) if isinstance(body, list) else body
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+    return Stub("http://x", "k", "m")
+
+
+def test_truncated_reasoning_without_answer_is_an_error_not_an_answer():
+    body = {"choices": [{"finish_reason": "length",
+                         "message": {"content": "", "reasoning_content": "Let me think about the papers..."}}]}
+    with pytest.raises(ModelError, match="finish_reason=length"):
+        _client_returning(body).complete([{"role": "user", "content": "q"}], max_tokens=100)
+
+
+def test_completed_reasoning_content_is_still_used_when_content_is_empty():
+    body = {"choices": [{"finish_reason": "stop", "message": {"content": "", "reasoning_content": "{\"ok\":1}"}}]}
+    assert _client_returning(body).complete([{"role": "user", "content": "q"}]) == "{\"ok\":1}"
+
+
+def test_gateway_token_cap_retries_once_at_16000():
+    seen = []
+    ok = {"choices": [{"finish_reason": "stop", "message": {"content": "answer"}}]}
+    client = _client_returning([ModelError("max_tokens too large"), ok], seen)
+    assert client.complete([{"role": "user", "content": "q"}], max_tokens=32000) == "answer"
+    assert seen == [32000, 16000]
+
+
+def test_bcde_calls_use_the_shared_output_budget(monkeypatch):
+    from core.llm import output_budget
+    assert output_budget() == 32000
+    monkeypatch.setenv("CONTEST_MAX_TOKENS", "50000")
+    assert output_budget() == 50000

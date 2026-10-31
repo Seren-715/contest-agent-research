@@ -19,7 +19,7 @@ from core.budget import Deadline
 from core.diagnostics import record_stage
 from core.config import Settings, case_budget_seconds
 from core.execution import check_active
-from core.llm import ModelClient
+from core.llm import ModelClient, output_budget
 from core.paperlib import (
     MaterialRecord,
     Paper,
@@ -100,7 +100,7 @@ def _expand_query_once(client: ModelClient, query: str, deadline: Deadline, time
                 },
             ],
             temperature=0.1,
-            max_tokens=400,
+            max_tokens=output_budget(),
             timeout=deadline.timeout(timeout, label="query expansion"),
         )
         data = extract_json_object(text)
@@ -246,7 +246,7 @@ class RetrievalHandler:
                     [{"role": "system", "content": SYSTEM},
                      {"role": "user", "content": prompt_prefix + "\n".join(listing) + prompt_suffix}],
                     temperature=0.1,
-                    max_tokens=min(6000, max(2000, len(batch) * 240)),
+                    max_tokens=output_budget(),
                     timeout=deadline.timeout(settings.request_timeout, label="retrieval rerank"),
                 )
                 raw_hits = extract_json_object(text).get("papers")
