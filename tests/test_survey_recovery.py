@@ -89,3 +89,43 @@ def test_impossibly_small_layout_budget_never_returns_only_source_names():
                               passages=(EvidencePassage(1, 0, len(text), text),)) for i in range(20)]
     matrix = survey_evidence_matrix(records, max_total_chars=1000)
     assert matrix.count("81.2") == 20
+
+
+def _survey_request(paths):
+    return {"case_id": "C-fact", "input": "比较指定论文", "materials": [str(path) for path in paths]}
+
+
+def test_fact_check_pass_replaces_draft_when_gate_is_not_worse(paper_settings, monkeypatch):
+    settings, paths = paper_settings
+    monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "1")
+    draft = _markdown([path.name for path in paths])
+    revised = draft.replace("在遥感数据上比较了绿地覆盖率与地表温度", "在遥感数据上讨论了地表温度")
+    client = FakeClient([draft, revised])
+    result = SurveyHandler().handle(_survey_request(paths), settings, client)
+    assert len(client.calls) == 2
+    assert "逐句事实核对" in client.calls[1][-1]["content"]
+    assert client.calls[1][-2] == {"role": "assistant", "content": draft}
+    assert "讨论了地表温度" in result["markdown"]
+
+
+def test_fact_check_pass_is_discarded_when_it_breaks_the_structural_gate(paper_settings, monkeypatch):
+    settings, paths = paper_settings
+    monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "1")
+    draft = _markdown([path.name for path in paths])
+    client = FakeClient([draft, "太短的修订"])
+    result = SurveyHandler().handle(_survey_request(paths), settings, client)
+    assert len(client.calls) == 2
+    assert result["markdown"].strip() == draft.strip()
+
+
+def test_fact_check_pass_is_skipped_without_enough_time_and_when_disabled(paper_settings, monkeypatch):
+    settings, paths = paper_settings
+    draft = _markdown([path.name for path in paths])
+    client = FakeClient([draft])
+    SurveyHandler().handle(_survey_request(paths), settings, client)  # disabled by default in tests
+    assert len(client.calls) == 1
+    monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "1")
+    monkeypatch.setattr("handlers.c_survey.FACT_CHECK_MIN_SECONDS", 10_000)
+    client = FakeClient([draft])
+    SurveyHandler().handle(_survey_request(paths), settings, client)
+    assert len(client.calls) == 1

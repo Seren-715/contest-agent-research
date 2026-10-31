@@ -11,6 +11,7 @@ from handlers.b_retrieval import RetrievalHandler, _rank_records
 from handlers.base import HandlerError
 from scripts.evaluate_retrieval import evaluate, evaluate_case
 from tests.conftest import FakeClient
+from pathlib import Path
 
 
 def _corpus(monkeypatch, tmp_path, count=26, body="Adaptive decoding for language inference throughput"):
@@ -219,3 +220,60 @@ def test_real_model_client_accepts_and_forwards_retrieval_timeouts(settings, tmp
     assert len(result["papers"]) == 1
     assert len(timeouts) == 2
     assert all(0 < timeout <= settings.request_timeout for timeout in timeouts)
+
+
+def test_query_expansion_retries_once_then_gives_up_with_warning(caplog):
+    from core.budget import Deadline
+    from handlers.b_retrieval import _expand_query
+
+    class Flaky:
+        def __init__(self, replies):
+            self.replies = list(replies)
+            self.calls = 0
+
+        def complete(self, *args, **kwargs):
+            self.calls += 1
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    recovered = Flaky([RuntimeError("upstream"), '{"keywords":["adaptive","decoding"]}'])
+    assert _expand_query(recovered, "自适应解码", Deadline(300), 30) == ["adaptive", "decoding"]
+    assert recovered.calls == 2
+
+    failing = Flaky(["not json", "still not json"])
+    with caplog.at_level("WARNING"):
+        assert _expand_query(failing, "自适应解码", Deadline(300), 30) == []
+    assert failing.calls == 2
+    assert "B query expansion produced no keywords" in caplog.text
+
+
+def test_all_model_failures_fall_back_to_labelled_lexical_matches_without_constraints(settings, tmp_path, monkeypatch):
+    _corpus(monkeypatch, tmp_path, count=2)
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
+                                       settings, FakeClient(["bad JSON"]))
+    assert len(result["papers"]) == 2
+    assert all("未经语义复核" in item["reason"] for item in result["papers"])
+    validate_answer("Literature_Retrieval", result)
+
+
+def test_returned_name_is_matched_case_insensitively_and_emitted_canonically(settings, tmp_path, monkeypatch):
+    _corpus(monkeypatch, tmp_path, count=2)
+    reply = '{"papers":[{"filename":"PAPER_00.PDF","reason":"正文研究自适应解码与语言推理吞吐量。"}]}'
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
+                                       settings, FakeClient([reply]))
+    assert [item["filename"] for item in result["papers"]] == ["paper_00.pdf"]
+
+
+def test_translated_keywords_rank_independently_of_the_cjk_query():
+    from handlers.b_retrieval import _rank_records
+
+    def make(name, body):
+        return MaterialRecord(path=Path(name), filename=name, sha256="t", bytes=1, pages=1,
+                              title=name, abstract=body, text=body)
+
+    relevant = make("english.pdf", "adaptive decoding for language inference throughput")
+    other = make("other.pdf", "botany observations")
+    ranked = _rank_records("自适应解码", [other, relevant], ("adaptive", "decoding"))
+    assert ranked[0][0].filename == "english.pdf" and ranked[0][1] > 0
