@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -137,6 +138,11 @@ class ModelClient:
             )
             response.raise_for_status()
             body = response.json()
+        except httpx.HTTPStatusError as exc:
+            # Keep the gateway's error text: callers decide on retries from it
+            # (e.g. an output-token cap). Body only, never request headers.
+            detail = " ".join(exc.response.text.split())[:500]
+            raise ModelError(f"model request failed: HTTP {exc.response.status_code}: {detail}") from exc
         except httpx.HTTPError as exc:
             raise ModelError(f"model request failed: {exc}") from exc
         except ValueError as exc:
@@ -154,6 +160,7 @@ class ModelClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> str:
+        started = time.monotonic()
         try:
             body = self.complete_raw(messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
         except ModelError as exc:
@@ -161,7 +168,12 @@ class ModelClient:
             if not (max_tokens and max_tokens > 16000 and any(h in str(exc).lower() for h in _TOKEN_LIMIT_HINTS)):
                 raise
             check_active()
-            body = self.complete_raw(messages, temperature=temperature, max_tokens=16000, timeout=timeout)
+            # The retry shares the caller's time budget; it never restarts it.
+            limit = self.timeout if timeout is None else min(self.timeout, timeout)
+            remaining = limit - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("no time remains for the model token-limit retry") from exc
+            body = self.complete_raw(messages, temperature=temperature, max_tokens=16000, timeout=remaining)
         choices = body.get("choices") or []
         if not choices:
             raise ModelError(f"model response has no choices: {body}")
