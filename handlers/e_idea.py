@@ -10,10 +10,14 @@ language, and the boundary between simulated observations and paper conclusions.
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import replace
 
-from core.config import Settings
+from core.config import Settings, case_budget_seconds
+from core.budget import Deadline
+from core.diagnostics import record_stage
+from core.execution import check_active
 from core.llm import ModelClient
-from core.paperlib import resolve_materials
+from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
 from handlers.evidence import novelty_overlap
 from handlers.reporting import audit, finalize, materials_bundle
@@ -57,13 +61,15 @@ CHECKLIST = (
 
 class IdeaHandler:
     def handle(self, question: dict[str, Any], settings: Settings, client: ModelClient) -> dict[str, Any]:
+        deadline = Deadline(case_budget_seconds("Idea", settings))
         case_id = question["case_id"]
         query = question_text(question)
-        paths = resolve_materials(question.get("materials"), settings.data_dir)
+        record_stage(settings, case_id, "material_resolution")
+        paths = select_report_materials(question, settings, client, deadline)
         if not paths:
             raise HandlerError("idea materials are missing: no PDFs resolved")
-        paths = paths[:6]
-        block, records = materials_bundle(paths, query=query, max_chars=1500)
+        block, records = materials_bundle(paths, query=query, max_chars=1500, deadline=deadline)
+        record_stage(settings, case_id, "evidence_ready", material_count=len(paths), evidence_chars=len(block))
         overlaps = novelty_overlap(query, records)
         overlap_lines = "\n".join(
             f"- {record.filename}：主题词重合度 {ratio:.0%}；标题：{record.title}"
@@ -84,14 +90,19 @@ class IdeaHandler:
             "直接输出 Markdown 正文，不要 JSON、不要代码围栏。"
         )
         messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": base_prompt}]
-        text = client.complete(
+        def complete(messages, temperature):
+            check_active()
+            timeout = deadline.timeout(settings.request_timeout, label="idea generation")
+            bounded = replace(client, timeout=min(client.timeout, timeout)) if isinstance(client, ModelClient) else client
+            return bounded.complete(messages, temperature=temperature, max_tokens=6000)
+        record_stage(settings, case_id, "model_generation")
+        text = complete(
             messages,
-            temperature=0.3,
-            max_tokens=6000,
+            0.3,
         )
         markdown = text.strip()
         report = audit(markdown, records, "Idea")
-        if report.blockers:
+        if report.blockers and deadline.remaining() >= 30:
             repair = (
                 "【证据闸门未通过】\n"
                 + report.repair_text()
@@ -99,10 +110,9 @@ class IdeaHandler:
                 "保留全部要求的小节，只输出 Markdown 正文。"
             )
             messages = messages + [{"role": "assistant", "content": text}, {"role": "user", "content": repair}]
-            text = client.complete(
+            text = complete(
                 messages,
-                temperature=0.2,
-                max_tokens=6000,
+                0.2,
             )
             markdown = text.strip()
         return finalize(

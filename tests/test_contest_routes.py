@@ -82,6 +82,15 @@ def test_failed_idea_is_http_error_without_invalid_answer_file(route_module, mon
     assert "secret-test-marker" not in caplog.text
 
 
+def test_retrieval_failure_is_not_disguised_as_valid_empty_answer(route_module, monkeypatch, tmp_path):
+    monkeypatch.setattr(route_module, "solve_task", lambda _: (_ for _ in ()).throw(RuntimeError("lookup failed")))
+    with TestClient(route_module.runtime.app) as client:
+        response = client.post("/solve", json=question("B-01", "Literature_Retrieval"))
+    assert response.status_code == 503
+    assert response.json()["code"] == "ERR_CASE_FAILED"
+    assert not (tmp_path / "data/test-team/B-01.json").exists()
+
+
 def test_route_timeout_result_cannot_be_overwritten(route_module, monkeypatch, tmp_path):
     release, finished, rejected = threading.Event(), threading.Event(), threading.Event()
     result = tmp_path / "data" / "test-team" / "A-01.json"

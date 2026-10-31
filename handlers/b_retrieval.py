@@ -143,7 +143,8 @@ class RetrievalHandler:
         limits = RetrievalLimits.from_env()
         query = question_text(question)
         record_stage(settings, case_id, "material_resolution")
-        paths = resolve_materials(question.get("materials"), settings.data_dir, allow_library=True)
+        paths = resolve_materials(question.get("materials"), settings.data_dir,
+                                  allow_library=True, allow_descriptions=True)
         if not paths:
             return {"case_id": case_id, "papers": []}
         # Do not trust extensions: keep only files that actually look like PDFs.
@@ -153,6 +154,8 @@ class RetrievalHandler:
         records = index_materials(paths, deadline=deadline)
         records = [record for record in records if record.text.strip()]
         record_stage(settings, case_id, "evidence_ready", resolved_count=len(paths), readable_count=len(records))
+        if not records:
+            raise HandlerError("retrieval materials have no extractable evidence")
         search_text = query
         if _has_cjk(query):
             keywords = _expand_query(client, query, deadline, settings.request_timeout)
@@ -181,6 +184,7 @@ class RetrievalHandler:
         )
         hits: list[dict[str, str]] = []
         seen: set[str] = set()
+        successful_batches = 0
         for offset in range(0, len(candidates), limits.batch_size):
             check_active()
             if deadline.remaining() < 2:
@@ -204,6 +208,7 @@ class RetrievalHandler:
                 raw_hits = extract_json_object(text).get("papers")
                 if not isinstance(raw_hits, list):
                     raise HandlerError("papers is not a list")
+                successful_batches += 1
             except Exception as exc:
                 check_active()
                 record_stage(settings, case_id, "model_rerank_failed", error_type=type(exc).__name__)
@@ -227,4 +232,6 @@ class RetrievalHandler:
             if len(hits) >= limits.results:
                 LOGGER.warning("B output budget reached: %d papers", limits.results)
                 break
+        if not successful_batches:
+            raise HandlerError("retrieval failed before any valid rerank response")
         return {"case_id": case_id, "papers": hits}

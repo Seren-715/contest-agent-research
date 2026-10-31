@@ -8,6 +8,7 @@ import pytest
 from core.paperlib import EvidencePassage, MaterialRecord
 from core.schemas import validate_answer
 from handlers.b_retrieval import RetrievalHandler, _rank_records
+from handlers.base import HandlerError
 from scripts.evaluate_retrieval import evaluate, evaluate_case
 from tests.conftest import FakeClient
 
@@ -65,8 +66,8 @@ def test_semantic_selection_does_not_require_token_overlap(settings, tmp_path, m
 
 def test_failed_model_with_exclusion_never_guesses_from_overlap(settings, tmp_path, monkeypatch):
     _corpus(monkeypatch, tmp_path, count=2)
-    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding excluding language inference"}, settings, FakeClient(["bad JSON"]))
-    assert result["papers"] == []
+    with pytest.raises(HandlerError, match="before any valid"):
+        RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding excluding language inference"}, settings, FakeClient(["bad JSON"]))
 
 
 def test_candidate_budget_is_configurable_and_visible(settings, tmp_path, monkeypatch, caplog):
@@ -164,8 +165,8 @@ def test_filename_match_without_readable_evidence_is_not_returned(settings, monk
     class MustNotCall:
         def complete(self, *args, **kwargs):
             pytest.fail("unread PDF must not become an evidence candidate")
-    result = RetrievalHandler().handle({"case_id": "B-01", "input": "QuarrySpec"}, settings, MustNotCall())
-    assert result["papers"] == []
+    with pytest.raises(HandlerError, match="no extractable evidence"):
+        RetrievalHandler().handle({"case_id": "B-01", "input": "QuarrySpec"}, settings, MustNotCall())
 
 
 def test_real_model_client_accepts_and_forwards_retrieval_timeouts(settings, tmp_path, monkeypatch):

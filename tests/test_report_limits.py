@@ -96,7 +96,7 @@ def test_over_limit_draft_requests_complete_model_repair(settings, monkeypatch, 
     import importlib
     module = importlib.import_module(module_name)
     settings.ensure_dirs()
-    monkeypatch.setattr(module, "resolve_materials", lambda *args: [Path("a.pdf")])
+    monkeypatch.setattr(module, "select_report_materials", lambda *args: [Path("a.pdf")])
     monkeypatch.setattr(module, "materials_bundle", lambda *args, **kwargs: ("[1] a.pdf 原文摘录", [_record()]))
     valid = _valid_draft()
     assert not report_limit_errors(valid, function)
@@ -122,7 +122,7 @@ def test_over_limit_draft_requests_complete_model_repair(settings, monkeypatch, 
 def test_idea_future_measurement_plan_saves_without_spurious_repair(settings, monkeypatch) -> None:
     import handlers.e_idea as module
     settings.ensure_dirs()
-    monkeypatch.setattr(module, "resolve_materials", lambda *args: [Path("a.pdf")])
+    monkeypatch.setattr(module, "select_report_materials", lambda *args: [Path("a.pdf")])
     monkeypatch.setattr(module, "materials_bundle", lambda *args, **kwargs: ("[1] a.pdf 原文摘录", [_record()]))
     plan = "计划在五个随机种子上重复实验，以准确率和吞吐作为评价指标，并将失败率低于百分之一设为验收目标。"
     markdown = _valid_draft().replace("## 参考文献", plan + "\n## 参考文献")

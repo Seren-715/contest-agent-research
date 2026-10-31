@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import logging
+import os
 from typing import Any
 
 from core.budget import Deadline
@@ -16,9 +17,9 @@ from core.diagnostics import record_stage
 from core.config import Settings, case_budget_seconds
 from core.execution import check_active
 from core.llm import ModelClient, ModelError
-from core.paperlib import resolve_materials
+from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
-from handlers.reporting import audit, finalize, survey_materials_bundle as materials_bundle
+from handlers.reporting import audit, finalize, materials_bundle, survey_materials_bundle
 
 SYSTEM = (
     "你是严谨的文献综述作者，按 PaperCode 的 Gate-Honest / ClaimLedger 纪律工作："
@@ -44,19 +45,27 @@ class SurveyHandler:
         case_id = question["case_id"]
         query = question_text(question)
         record_stage(settings, case_id, "material_resolution")
-        paths = resolve_materials(question.get("materials"), settings.data_dir)
+        paths = select_report_materials(question, settings, client, deadline)
         if not paths:
             raise HandlerError("survey materials are missing: no PDFs resolved")
-        record_stage(settings, case_id, "evidence_matrix", material_count=len(paths))
-        block, records = materials_bundle(paths, query=query, deadline=deadline)
+        use_matrix = os.environ.get("CONTEST_SURVEY_EVIDENCE_MATRIX", "0") == "1"
+        record_stage(settings, case_id, "evidence_matrix" if use_matrix else "evidence_excerpt", material_count=len(paths))
+        if use_matrix:
+            block, records = survey_materials_bundle(paths, query=query, deadline=deadline)
+        else:
+            block, records = materials_bundle(paths, query=query, max_chars=1800, deadline=deadline)
         record_stage(settings, case_id, "evidence_ready", record_count=len(records), evidence_chars=len(block))
         extra = constraints_text(question)
+        evidence_heading = (
+            "指定论文的候选证据矩阵（编号、完整文件名、内容哈希、PDF页码和原文跨度）：\n"
+            if use_matrix else "指定论文（编号、完整文件名与可定位的原文摘录）：\n"
+        )
         base_prompt = (
             f"综述任务：{query}\n\n"
             f"额外约束：\n{extra or '（无）'}\n\n"
-            "指定论文的候选证据矩阵（编号、完整文件名、内容哈希、PDF页码和原文跨度）：\n"
+            f"{evidence_heading}"
             f"{block}\n\n"
-            "矩阵标签仅用于检索原文，不是已核实事实；先按研究问题、方法、数据与实验条件、指标、"
+            "原文摘录及候选标签不是已核实事实；先按研究问题、方法、数据与实验条件、指标、"
             "结果与比较、局限六维整理各论文事实，再写综述。缺失信息明确未核验，不补造。"
             "具体数值须同时核对方法、数据集、单位、指标、实验条件和比较对象；"
             "原文存在同一数字不等于支持该事实。尽量覆盖各篇论文的具体贡献和条件，"

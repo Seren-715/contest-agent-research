@@ -24,7 +24,7 @@ from core.config import Settings
 from core.budget import Deadline
 from core.io import write_report
 from core.execution import check_active
-from core.paperlib import Paper, MaterialRecord, evidence_excerpt, index_materials, terms
+from core.paperlib import MaterialRecord, evidence_excerpt, index_materials, terms
 from core.schemas import report_limit_errors
 from handlers.base import HandlerError, strip_fences
 from handlers.evidence import AuditReport, audit_report, ensure_coverage
@@ -43,6 +43,24 @@ SURVEY_FACETS = (
 )
 
 
+def _compact_matrix(records: list[MaterialRecord], query: str, max_chars: int) -> str:
+    """Keep one bounded source window per paper when the facet layout is too large."""
+    headers = [f"[{index}] 完整文件名：{record.filename}\n" for index, record in enumerate(records, 1)]
+    room = max_chars - sum(map(len, headers)) - 2 * len(headers)
+    # The matrix limit is a soft layout budget. Do not trade away every
+    # source quote merely to fit headers in an unrealistically small budget.
+    per_paper = max(120, room // max(1, len(records)))
+    blocks: list[str] = []
+    for header, record in zip(headers, records):
+        excerpt = evidence_excerpt(record, query=query, max_chars=per_paper)
+        blocks.append(header + excerpt)
+    result = "\n\n".join(blocks)
+    # Source identities are not silently discarded to satisfy a cosmetic
+    # layout budget. Real model context limits still belong to the caller.
+    logging.getLogger(__name__).warning("survey_matrix_compacted papers=%d chars=%d budget=%d", len(records), len(result), max_chars)
+    return result
+
+
 def survey_evidence_matrix(
     records: list[MaterialRecord], *, query: str = "", max_total_chars: int = 36000,
 ) -> str:
@@ -58,7 +76,7 @@ def survey_evidence_matrix(
     available = max_total_chars - sum(len(header) for header in headers) - 2 * len(records)
     per_paper = min(6000, available // len(records))
     if per_paper < 600:
-        raise HandlerError("survey evidence budget cannot cover all specified papers")
+        return _compact_matrix(records, query, max_total_chars)
     query_terms = set(terms(query))
     blocks: list[str] = []
     for header, record in zip(headers, records):
@@ -107,10 +125,14 @@ def survey_evidence_matrix(
             notes += "解析限制：" + "；".join(warnings)[:400] + "\n"
         # Reserve notes first, then divide the remainder between facets. Long
         # abstracts cannot consume the budget belonging to result/limit pages.
+        window_limit = max(1, (per_paper - len(notes)) // 180)
+        if len(selected) > window_limit:
+            selected = dict(sorted(selected.items(), key=lambda item: -len(item[1]))[:window_limit])
+            notes += "预算限制：只保留部分候选窗口。\n"
         quote_budget = max(0, per_paper - len(notes) - 100 * len(selected))
         each = min(1200, quote_budget // max(1, len(selected)))
         if selected and each < 80:
-            raise HandlerError("survey evidence budget cannot retain located source passages for all papers")
+            return _compact_matrix(records, query, max_total_chars)
         lines: list[str] = []
         for (position, match_start), labels in selected.items():
             page, start, _, raw = candidates[position]
@@ -125,7 +147,7 @@ def survey_evidence_matrix(
         blocks.append(block)
     result = "\n\n".join(blocks)
     if len(result) > max_total_chars:
-        raise HandlerError("survey evidence matrix exceeded its configured budget")
+        return _compact_matrix(records, query, max_total_chars)
     return result
 
 
@@ -141,13 +163,13 @@ def materials_bundle(
     *,
     query: str = "",
     max_chars: int = 1500,
+    deadline: Deadline | None = None,
 ) -> tuple[str, list[MaterialRecord]]:
     """Return the prompt block plus indexed records for the evidence gate."""
-    records = index_materials(paths, max_pages=12, max_chars=48000, page_selection="head_tail")
+    records = index_materials(paths, deadline=deadline)
     blocks: list[str] = []
     for index, record in enumerate(records, start=1):
-        paper = Paper(path=record.path, filename=record.filename, text=record.text)
-        excerpt = evidence_excerpt(paper, query=query, max_chars=max_chars)
+        excerpt = evidence_excerpt(record, query=query, max_chars=max_chars)
         blocks.append(f"[{index}] 完整文件名：{record.filename}\n{excerpt}")
     return "\n\n".join(blocks), records
 

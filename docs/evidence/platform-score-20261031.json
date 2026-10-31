@@ -1,0 +1,25 @@
+{
+  "source": "user screenshots transcribed 2026-10-31; personal information excluded",
+  "evaluation_id": "eval-20261031-c19c1a2f",
+  "image_version_user_confirmed": "1.6.1-path-fix",
+  "image_digest_platform_verified": false,
+  "automatic_score": 34.3,
+  "agent_tokens": 15914,
+  "test_only": true,
+  "expert_review": "pending",
+  "categories": {"A": 5, "B": 0, "C": 0, "D": 29.3, "E": 0},
+  "cases": [
+    {"case_id": "A-01", "status": "protocol_valid", "score": 5, "calls": 1, "tokens": 294},
+    {"case_id": "B-01", "status": "protocol_valid", "score": 0, "calls": 0, "pure_ms": 147},
+    {"case_id": "B-02", "status": "protocol_valid", "score": 0, "calls": 0, "pure_ms": 172},
+    {"case_id": "B-03", "status": "protocol_valid", "score": 0, "calls": 0, "pure_ms": 168},
+    {"case_id": "C-01", "status": "error", "score": 0, "calls": 0, "pure_ms": 148},
+    {"case_id": "C-03", "status": "error", "score": 0, "calls": 0, "pure_ms": 165},
+    {"case_id": "D-01", "status": "protocol_valid", "score": 40, "calls": 1, "tokens": 4362},
+    {"case_id": "D-02", "status": "protocol_valid", "score": 40, "calls": 1, "tokens": 6617},
+    {"case_id": "D-05", "status": "protocol_valid", "score": 8, "calls": 1, "tokens": 4641},
+    {"case_id": "E-01", "status": "error", "score": 0, "calls": 0, "pure_ms": 127},
+    {"case_id": "E-02", "status": "error", "score": 0, "calls": 0, "pure_ms": 128}
+  ],
+  "limits": "No platform question JSON, raw report, diagnostic receipt or judge evidence available; shared pre-model failure inferred, exact material trigger unconfirmed. D-05 score regression remains unassigned."
+}

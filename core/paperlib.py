@@ -248,11 +248,30 @@ def evidence_excerpt(paper: Paper | MaterialRecord, query: str = "", max_chars: 
             label = f"[p.{passage.page}, chars {passage.start}:{passage.end}] "
             value = label + passage.text
             if len(value) + 1 > remaining:
-                # Never invent a shorter span with the old span's coordinates.
                 length = remaining - len(label) - 1
-                if length > 80:
-                    label = f"[p.{passage.page}, chars {passage.start}:{passage.start + length}] "
-                    value = label + passage.text[:length]
+                if length >= 24:
+                    lowered = passage.text.lower()
+                    keywords = {term for term in terms(query) if len(term) > 1}
+                    offsets = {0}
+                    for term in keywords:
+                        position = lowered.find(term)
+                        if position >= 0:
+                            offsets.add(max(0, min(position - length // 3, len(lowered) - length)))
+                    start = max(sorted(offsets), key=lambda offset: (
+                        sum(term in lowered[offset:offset + length] for term in keywords),
+                        bool(re.search(r"\d", lowered[offset:offset + length])), -offset,
+                    ))
+                    source_start = passage.start + start
+                    # Updating a locator can add digits; fit the exact label,
+                    # quote and end offset together, never relabel old text.
+                    for _ in range(4):
+                        quote = passage.text[start:start + length]
+                        label = f"[p.{passage.page}, chars {source_start}:{source_start + len(quote)}] "
+                        excess = len(label) + len(quote) + 1 - remaining
+                        if excess <= 0:
+                            break
+                        length -= excess
+                    value = label + quote
                 else:
                     continue
             if len(value) + 1 <= remaining:
@@ -305,6 +324,8 @@ def _passages(text: str, page: int, size: int = 1200, overlap: int = 200) -> lis
 def rank_passages(query: str, record: MaterialRecord) -> list[tuple[EvidencePassage, float]]:
     """Rank exact page spans, with deterministic page/offset tie breaking."""
     passages = list(record.passages)
+    if not terms(query):
+        return [(passage, 0.0) for passage in passages]
     documents = [Paper(record.path, f"{item.page:08d}:{item.start:08d}", item.text) for item in passages]
     ranked = bm25_rank(query, documents, top_k=len(documents))
     lookup = {document.filename: passage for document, passage in zip(documents, passages)}
@@ -495,13 +516,71 @@ class MaterialResolutionError(RuntimeError):
         super().__init__(message)
 
 
+def is_material_description(value: object) -> bool:
+    """Identify a natural-language paper scope, never a missing concrete path.
+
+    Official examples describe a local/assigned paper collection instead of
+    naming files. Such entries require task-specific selection after discovery.
+    A PDF filename, explicit path or glob is not a description.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or re.search(r"[\\/:*?]", text) or re.search(r"\.[a-zA-Z0-9]{1,12}(?:\s|$)", text):
+        return False
+    chinese_scope = re.search(r"本地|本题|指定|允许|提供", text)
+    chinese_papers = re.search(r"论文|文献|PDF", text, re.IGNORECASE)
+    if chinese_scope and chinese_papers:
+        return True
+    return bool(re.search(r"\b(?:local|specified|provided|permitted|allowed)\b.*\b(?:papers?|pdfs?|literature)\b",
+                          text, re.IGNORECASE))
+
+
+def describe_material_scope(materials: object) -> list[str]:
+    """Return declared descriptions for a caller's explicit selection stage."""
+    values = [materials] if isinstance(materials, str) else materials
+    if not isinstance(values, list):
+        return []
+    return [value.strip() for value in values if is_material_description(value)]
+
+
+def has_explicit_material_scope(materials: object) -> bool:
+    """Recognize ordinary PDF/directory declarations, after strict resolution.
+
+    This is a routing hint, not path authorization. Callers can resolve the
+    non-description subset separately when directory names contain extensions.
+    """
+    values = [materials] if isinstance(materials, str) else materials
+    if not isinstance(values, list):
+        return False
+    for value in values:
+        if not isinstance(value, str) or not value.strip() or is_material_description(value):
+            continue
+        path = Path(value)
+        if path.suffix.lower() == ".pdf" or not path.suffix or path.is_dir():
+            return True
+    return False
+
+
+def _identical_materials(paths: list[Path]) -> bool:
+    """Separate mount copies are equivalent only after exact content hashing."""
+    if not paths or any(not path.is_file() for path in paths):
+        return False
+    if len({path.stat().st_size for path in paths}) != 1:
+        return False
+    hashes = [file_sha256(path) for path in paths]
+    return bool(hashes[0]) and len(set(hashes)) == 1
+
+
 def resolve_materials(
     materials: object, settings_data_dir: Path, *, allow_library: bool = False,
+    allow_descriptions: bool = False,
 ) -> list[Path]:
-    """Resolve only declared materials; whole-library discovery is B-only opt-in.
+    """Resolve declared materials; description discovery needs explicit opt-in.
 
     Missing declarations never broaden scope. Ambiguous basenames are errors,
     not an invitation to pick whichever root happened to be searched first.
+    Description-only discovery returns candidates, not a selected C/E corpus.
     """
     roots = _paper_roots(settings_data_dir)
     allowed = [settings_data_dir.resolve(), Path("/data").resolve()]
@@ -517,24 +596,52 @@ def resolve_materials(
             raise MaterialResolutionError(f"material outside allowed data roots: {path.name}")
         return path.resolve()
 
+    def discover_library(*, descriptions_only: bool = False) -> list[Path]:
+        declared: list[Path] = []
+        libraries = [root for root in roots if root.name in ("论文库", "papers") and root.is_dir()]
+        for root in (libraries if descriptions_only else (libraries or roots)):
+            if root.exists():
+                declared.extend(list_pdfs(root))
+        return [checked(path) for path in declared]
+
+    def identical_pdf_scopes(directories: list[Path]) -> bool:
+        if not directories or any(not directory.is_dir() for directory in directories):
+            return False
+        # Compare only PDF scope. Auxiliary files are neither read nor claimed
+        # to be equivalent. Never union distinct directory scopes implicitly.
+        scopes: list[dict[str, Path]] = []
+        for directory in directories:
+            check_active()
+            scopes.append({path.relative_to(directory).as_posix(): checked(path)
+                           for path in list_pdfs(directory)})
+        keys = set(scopes[0])
+        if any(set(scope) != keys for scope in scopes[1:]):
+            return False
+        for key in keys:
+            check_active()
+            if not _identical_materials([scope[key] for scope in scopes]):
+                return False
+        return True
+
     missing = materials is None or materials == []
     if missing:
         if not allow_library:
             return []
-        # Standard library roots can be nested; deduplicate exact paths later.
-        declared = []
-        libraries = [root for root in roots if root.name in ("论文库", "papers") and root.is_dir()]
-        for root in (libraries or roots):
-            if root.exists():
-                declared.extend(list_pdfs(root))
-        candidates = [checked(path) for path in declared]
+        candidates = discover_library()
     else:
         values = [materials] if isinstance(materials, str) else materials
         if not isinstance(values, list) or any(not isinstance(item, str) or not item.strip() for item in values):
             raise MaterialResolutionError("materials must contain nonempty path strings")
         candidates = []
+        descriptions: list[str] = []
+        explicit_paper_scope = False
         for item in values:
             check_active()
+            if is_material_description(item):
+                if not allow_descriptions:
+                    raise MaterialResolutionError("descriptive material scope requires explicit selection")
+                descriptions.append(item)
+                continue
             path = Path(item)
             if ".." in path.parts:
                 raise MaterialResolutionError("material path contains parent traversal")
@@ -558,25 +665,43 @@ def resolve_materials(
                 found = [checked(value) for value in exact if value.exists()]
                 if len(path.parts) == 1:
                     found.extend(checked(value) for root in roots if root.exists()
-                                 for value in root.rglob(path.name))
+                                 for value in root.rglob("*") if value.name == path.name)
             found = list(dict.fromkeys(found))
             if not found:
                 raise MaterialResolutionError(f"declared material not found: {path.name}")
-            if len(found) != 1:
+            if len(found) != 1 and not (_identical_materials(found) or identical_pdf_scopes(found)):
                 raise MaterialResolutionError(f"ambiguous declared material: {path.name}")
             value = found[0]
             if value.is_dir():
+                explicit_paper_scope = True
                 candidates.extend(checked(pdf) for pdf in list_pdfs(value))
             elif value.is_file() and value.suffix.lower() == ".pdf":
+                explicit_paper_scope = True
                 candidates.append(value)
+            elif value.is_file():
+                # It remains an authorized declared input, but this helper
+                # only indexes PDFs and must not claim to have read the file.
+                logging.getLogger(__name__).info("material_auxiliary_not_indexed suffix=%s", value.suffix.lower())
             else:
-                raise MaterialResolutionError(f"declared material is not a PDF or directory: {path.name}")
+                raise MaterialResolutionError(f"declared material is not a regular file or directory: {path.name}")
+        if descriptions:
+            if not explicit_paper_scope:
+                candidates = discover_library(descriptions_only=True)
+                logging.getLogger(__name__).warning(
+                    "material_description_scope descriptions=%d candidates=%d requires_selection=true",
+                    len(descriptions), len(candidates),
+                )
+            else:
+                logging.getLogger(__name__).info(
+                    "material_description_scope descriptions=%d explicit_pdfs=%d no_scope_expansion=true",
+                    len(descriptions), len(candidates),
+                )
     names: dict[str, Path] = {}
     unique: list[Path] = []
     for path in candidates:
         key = path.name.lower()
         if key in names:
-            if names[key] != path:
+            if names[key] != path and not _identical_materials([names[key], path]):
                 raise MaterialResolutionError(f"ambiguous PDF filename: {path.name}")
             continue
         names[key] = path

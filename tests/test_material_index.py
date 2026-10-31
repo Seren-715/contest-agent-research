@@ -6,7 +6,8 @@ from pypdf import PdfReader
 from core.execution import ExecutionCancelled, ExecutionControl, execution_context
 from core.budget import Deadline
 from core.paperlib import (
-    MaterialResolutionError, evidence_excerpt, index_materials, resolve_materials, terms,
+    MaterialResolutionError, describe_material_scope, evidence_excerpt, index_materials,
+    has_explicit_material_scope, is_material_description, resolve_materials, terms,
 )
 
 
@@ -57,12 +58,14 @@ def test_page_limit_is_explicit_and_samples_across_document(tmp_path):
     assert "pdf_page_limit" in record.warnings
 
 
-def test_idea_legacy_bundle_keeps_head_eight_tail_four_pages(tmp_path):
+def test_shared_bundle_reads_all_pages_and_keeps_evidence_without_query(tmp_path):
     from handlers.reporting import materials_bundle
     path = tmp_path / "idea.pdf"
     make_pdf(path, [f"Source page {number + 1}." for number in range(24)])
-    _, records = materials_bundle([path])
-    assert records[0].indexed_pages == tuple(list(range(1, 9)) + list(range(21, 25)))
+    block, records = materials_bundle([path])
+    assert records[0].indexed_pages == tuple(range(1, 25))
+    assert "Source page 1" in block
+    assert "p.1" in block
 
 
 def test_byte_limit_prevents_reader_construction(tmp_path, monkeypatch):
@@ -98,6 +101,22 @@ def test_exhausted_work_budget_does_not_start_pdf_parse(tmp_path, monkeypatch):
 def test_chinese_phrase_matches_inside_unsegmented_sentence():
     assert {"检索", "索增", "增强"} <= set(terms("检索增强"))
     assert set(terms("检索增强")) & set(terms("本文提出检索增强生成方法"))
+
+
+@pytest.mark.parametrize("budget", [120, 750])
+def test_excerpt_window_keeps_late_query_hit_and_exact_locator(budget):
+    import re
+    from core.paperlib import MaterialRecord, EvidencePassage
+    raw = "Generic background prose. " * 40 + "QuarrySpec evaluates ZebraSet accuracy 81.2 percent under condition Z."
+    record = MaterialRecord(Path("p.pdf"), "p.pdf", "a" * 64, 100, 1, "Study", "Background", raw,
+                            passages=(EvidencePassage(10, 73, 73 + len(raw), raw),))
+    excerpt = evidence_excerpt(record, "QuarrySpec ZebraSet accuracy", max_chars=budget)
+    assert len(excerpt) <= budget
+    assert "QuarrySpec" in excerpt and "81.2" in excerpt
+    match = re.search(r"chars (\d+):(\d+)\] (.*)", excerpt)
+    assert match
+    begin, end = int(match[1]) - 73, int(match[2]) - 73
+    assert raw[begin:end] == match[3]
 
 
 def library(tmp_path):
@@ -172,10 +191,123 @@ def test_package_relative_materials_resolve_separate_readonly_mount(tmp_path, mo
 def test_package_relative_path_still_rejects_two_real_matches(tmp_path, monkeypatch):
     data = tmp_path / "output" / "data"
     mount = tmp_path / "readonly-data"
-    for base in [data, mount]:
+    for index, base in enumerate([data, mount]):
         source = base / "论文库" / "source.pdf"
         source.parent.mkdir(parents=True)
-        source.write_bytes(b"%PDF-")
+        source.write_bytes(b"%PDF-" + bytes([index]))
     monkeypatch.setenv("DATA_PATH", str(mount))
     with pytest.raises(MaterialResolutionError, match="ambiguous"):
         resolve_materials(["data/论文库/source.pdf"], data)
+
+
+@pytest.mark.parametrize("declaration", ["source.pdf", "data/论文库/source.pdf"])
+def test_identical_pdf_copies_across_mounts_are_one_material(tmp_path, monkeypatch, declaration):
+    data = tmp_path / "output" / "data"
+    mount = tmp_path / "readonly-data"
+    for base in [data, mount]:
+        source = base / "论文库" / "source.pdf"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"%PDF-identical")
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    assert resolve_materials([declaration], data) == [data / "论文库" / "source.pdf"]
+    assert len(resolve_materials([], data, allow_library=True)) == 1
+
+
+def test_explicit_pdf_and_existing_auxiliary_file_do_not_fail_entire_scope(tmp_path):
+    data, root = library(tmp_path)
+    note = root / "conditions.txt"
+    note.write_text("Experiment conditions", encoding="utf-8")
+    assert resolve_materials([str(root / "allowed.pdf"), str(note)], data) == [root / "allowed.pdf"]
+    assert resolve_materials([str(note)], data) == []
+    with pytest.raises(MaterialResolutionError, match="not found"):
+        resolve_materials([str(root / "allowed.pdf"), "missing.txt"], data)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not authorized", encoding="utf-8")
+    with pytest.raises(MaterialResolutionError, match="outside allowed"):
+        resolve_materials([str(outside)], data)
+
+
+@pytest.mark.parametrize("description", [
+    "本地论文文件夹内的 PDF",
+    "本地论文文件夹内指定的电池回收 PDF",
+    "本题指定的城市气候与步行规划论文 PDF",
+    "Local papers provided for this question",
+])
+def test_official_descriptions_require_opt_in_and_explicit_selection(tmp_path, description, caplog):
+    data, root = library(tmp_path)
+    assert is_material_description(description)
+    assert describe_material_scope([description]) == [description]
+    with pytest.raises(MaterialResolutionError, match="requires explicit selection"):
+        resolve_materials([description], data)
+    assert resolve_materials([description], data, allow_descriptions=True) == [root / "allowed.pdf"]
+    assert "requires_selection=true" in caplog.text
+
+
+@pytest.mark.parametrize("concrete", ["missing.pdf", "本题指定的论文.pdf", "data/papers/missing.pdf", "*.pdf"])
+def test_concrete_missing_never_turns_into_a_description(tmp_path, concrete):
+    data, _ = library(tmp_path)
+    assert not is_material_description(concrete)
+    with pytest.raises(MaterialResolutionError, match="not found"):
+        resolve_materials([concrete], data, allow_descriptions=True)
+
+
+def test_description_does_not_expand_explicit_pdf_selection(tmp_path):
+    data, root = library(tmp_path)
+    (root / "other.pdf").write_bytes(b"%PDF-other")
+    description = "本地论文文件夹内的 PDF"
+    assert resolve_materials([description, "allowed.pdf"], data, allow_descriptions=True) == [root / "allowed.pdf"]
+    with pytest.raises(MaterialResolutionError, match="not found"):
+        resolve_materials([description, "missing.pdf"], data, allow_descriptions=True)
+    assert resolve_materials([], data, allow_descriptions=True) == []
+    empty = root / "empty"
+    empty.mkdir()
+    assert resolve_materials([description, str(empty)], data, allow_descriptions=True) == []
+
+
+def test_description_discovery_does_not_scan_the_entire_data_mount(tmp_path, monkeypatch):
+    data = tmp_path / "output" / "data"
+    mount = tmp_path / "mount"
+    mount.mkdir()
+    (mount / "unrelated.pdf").write_bytes(b"%PDF-")
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    assert resolve_materials(["本题指定的论文 PDF"], data, allow_descriptions=True) == []
+
+
+def test_material_scope_routing_distinguishes_auxiliary_and_pdf_declarations():
+    assert not has_explicit_material_scope(["本题指定的论文 PDF", "conditions.csv"])
+    assert has_explicit_material_scope(["本题指定的论文 PDF", "data/papers/allowed.pdf"])
+    assert has_explicit_material_scope(["本题指定的论文 PDF", "data/papers"])
+    assert not has_explicit_material_scope([])
+
+
+def test_duplicate_directory_mount_requires_equal_pdf_paths_and_contents(tmp_path, monkeypatch):
+    data = tmp_path / "output" / "data"
+    mount = tmp_path / "readonly-data"
+    for base in [data, mount]:
+        folder = base / "papers" / "topic"
+        folder.mkdir(parents=True)
+        (folder / "source.pdf").write_bytes(b"%PDF-identical")
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    # Auxiliary differences do not expand PDF scope and are not read here.
+    (mount / "papers" / "notes.txt").write_text("not indexed", encoding="utf-8")
+    assert resolve_materials(["data/papers"], data) == [data / "papers" / "topic" / "source.pdf"]
+    extra = mount / "papers" / "extra.pdf"
+    extra.write_bytes(b"%PDF-extra")
+    with pytest.raises(MaterialResolutionError, match="ambiguous"):
+        resolve_materials(["data/papers"], data)
+    extra.unlink()
+    (mount / "papers" / "topic" / "source.pdf").write_bytes(b"%PDF-different")
+    with pytest.raises(MaterialResolutionError, match="ambiguous"):
+        resolve_materials(["data/papers"], data)
+
+
+def test_directory_mount_with_same_basename_in_different_relative_path_is_ambiguous(tmp_path, monkeypatch):
+    data = tmp_path / "output" / "data"
+    mount = tmp_path / "readonly-data"
+    for base, subdir in [(data, "topic"), (mount, "other")]:
+        folder = base / "papers" / subdir
+        folder.mkdir(parents=True)
+        (folder / "source.pdf").write_bytes(b"%PDF-identical")
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    with pytest.raises(MaterialResolutionError, match="ambiguous"):
+        resolve_materials(["data/papers"], data)

@@ -78,7 +78,7 @@ def _safe_fallback(case_id: str, function: str, question: dict[str, Any]) -> dic
     if function == "Chat":
         output = _fallback_chat(case_id)
     elif function == "Literature_Retrieval":
-        output = {"case_id": case_id, "papers": []}
+        raise RuntimeError("retrieval failed without a valid answer; inspect case diagnostics")
     elif function in ("Survey", "Idea"):
         output = _fallback_report(settings, question, function) or {
             "case_id": case_id,

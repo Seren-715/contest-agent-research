@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from core.paperlib import EvidencePassage, MaterialRecord, index_materials
-from handlers.base import HandlerError
 from handlers.c_survey import SurveyHandler
 from handlers.reporting import survey_evidence_matrix
 from tests.conftest import FakeClient
@@ -35,14 +34,16 @@ def test_matrix_preserves_late_results_with_exact_page_offsets():
     assert "候选维度=" in matrix
 
 
-def test_matrix_budget_covers_last_paper_or_fails_explicitly():
+def test_matrix_budget_compacts_without_creating_new_failure():
     records = [_record([EvidencePassage(1, 0, 40, "Method and dataset results need comparison.")], f"paper{i}.pdf")
                for i in range(12)]
     matrix = survey_evidence_matrix(records)
     assert "[12] 完整文件名：paper11.pdf" in matrix
     assert len(matrix) <= 36000
-    with pytest.raises(HandlerError, match="cannot cover all"):
-        survey_evidence_matrix(records, max_total_chars=2000)
+    compact = survey_evidence_matrix(records, max_total_chars=2000)
+    assert "[12] 完整文件名：paper11.pdf" in compact
+    assert "Method and dataset" in compact
+    assert len(compact) <= 2000
 
 
 def test_full_pdf_index_to_matrix_preserves_middle_results_and_late_limits(tmp_path):
@@ -78,7 +79,9 @@ def test_matrix_quote_window_keeps_keyword_far_into_passage():
     assert "原文字符[50:" not in matrix
 
 
-def test_survey_includes_seventh_specified_pdf_and_saves_it(paper_settings):
+@pytest.mark.parametrize("use_matrix", [False, True])
+def test_survey_includes_seventh_specified_pdf_and_saves_it(paper_settings, monkeypatch, use_matrix):
+    monkeypatch.setenv("CONTEST_SURVEY_EVIDENCE_MATRIX", "1" if use_matrix else "0")
     settings, paths = paper_settings
     for index in range(2):
         path = paths[0].parent / f"additional{index}.pdf"
@@ -90,7 +93,7 @@ def test_survey_includes_seventh_specified_pdf_and_saves_it(paper_settings):
                                     "materials": [str(p) for p in paths]}, settings, client)
     assert paths[-1].name in result["markdown"]
     assert paths[-1].name in client.calls[0][1]["content"]
-    assert "候选证据矩阵" in client.calls[0][1]["content"]
+    assert ("候选证据矩阵" in client.calls[0][1]["content"]) is use_matrix
     assert (settings.workspace_root / result["path"]).read_text(encoding="utf-8") == result["markdown"]
 
 

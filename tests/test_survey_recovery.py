@@ -1,0 +1,61 @@
+from pathlib import Path
+
+import pytest
+
+from core.paperlib import EvidencePassage, MaterialRecord
+from handlers.c_survey import SurveyHandler
+from handlers.reporting import materials_bundle, survey_evidence_matrix
+from tests.conftest import FakeClient
+from tests.test_handlers_papers import _markdown, paper_settings
+
+
+def test_default_survey_uses_exact_materials_without_selection_call(paper_settings, monkeypatch):
+    import handlers.c_survey as module
+    settings, paths = paper_settings
+    monkeypatch.delenv("CONTEST_SURVEY_EVIDENCE_MATRIX", raising=False)
+    monkeypatch.setattr(module, "survey_materials_bundle", lambda *args, **kwargs: pytest.fail("matrix is opt-in"))
+    client = FakeClient([_markdown([path.name for path in paths])])
+    result = SurveyHandler().handle({"case_id": "C-exact", "input": "比较指定论文",
+                                    "materials": [str(path) for path in paths]}, settings, client)
+    assert len(client.calls) == 1
+    assert "候选证据矩阵" not in client.calls[0][1]["content"]
+    assert all(path.name in client.calls[0][1]["content"] for path in paths)
+    assert (settings.workspace_root / result["path"]).read_text(encoding="utf-8") == result["markdown"]
+
+
+def test_shared_excerpt_bundle_indexes_middle_page_with_page_locator(paper_settings):
+    from fpdf import FPDF
+    settings, paths = paper_settings
+    path = paths[0].parent / "middle.pdf"
+    pdf = FPDF()
+    for number in range(24):
+        pdf.add_page()
+        pdf.set_font("Helvetica", size=10)
+        text = "Results: QuarrySpec accuracy 81.2 percent on ZebraSet." if number == 9 else "General background."
+        pdf.multi_cell(0, 5, text)
+    pdf.output(str(path))
+    block, records = materials_bundle([path], query="QuarrySpec ZebraSet accuracy", max_chars=1800)
+    assert records[0].indexed_pages == tuple(range(1, 25))
+    assert "p.10" in block and "81.2" in block
+
+
+def test_low_matrix_budget_reduces_windows_instead_of_rejecting_report():
+    records = []
+    for number in range(14):
+        text = "Method: dataset measurements compare accuracy results under fixed conditions."
+        passages = tuple(EvidencePassage(page, 0, len(text), text) for page in range(1, 15))
+        records.append(MaterialRecord(Path(f"paper{number}.pdf"), f"paper{number}.pdf", "a" * 64,
+                                      100, 14, "Study", text, text, passages=passages))
+    result = survey_evidence_matrix(records, query="accuracy", max_total_chars=3000)
+    assert len(result) <= 3000
+    for number in range(14):
+        assert f"paper{number}.pdf" in result
+    assert "accuracy" in result
+
+
+def test_impossibly_small_layout_budget_never_returns_only_source_names():
+    text = "Accuracy is 81.2 percent under the stated experimental condition."
+    records = [MaterialRecord(Path(f"p{i}.pdf"), f"p{i}.pdf", "a" * 64, 100, 1, "Study", text, text,
+                              passages=(EvidencePassage(1, 0, len(text), text),)) for i in range(20)]
+    matrix = survey_evidence_matrix(records, max_total_chars=1000)
+    assert matrix.count("81.2") == 20
