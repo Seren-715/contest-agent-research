@@ -233,3 +233,56 @@ def test_bcde_calls_use_the_shared_output_budget(monkeypatch):
     assert output_budget() == 32000
     monkeypatch.setenv("CONTEST_MAX_TOKENS", "50000")
     assert output_budget() == 50000
+
+
+def test_token_limit_retry_only_gets_the_remaining_call_time(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("core.llm.time.monotonic", lambda: clock[0])
+    seen = []
+    ok = {"choices": [{"finish_reason": "stop", "message": {"content": "answer"}}]}
+
+    def make(cost, replies):
+        from core.llm import ModelClient
+
+        class Stub(ModelClient):
+            def complete_raw(self, messages, **kwargs):
+                seen.append(kwargs["timeout"])
+                clock[0] += cost
+                item = replies.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+        return Stub("http://x", "k", "m")
+
+    client = make(0.10, [ModelError("max_tokens too large"), ok])
+    assert client.complete([{"role": "user", "content": "q"}], max_tokens=32000, timeout=0.15) == "answer"
+    assert seen[0] == 0.15 and abs(seen[1] - 0.05) < 1e-9
+
+    seen.clear()
+    clock[0] = 0.0
+    client = make(0.20, [ModelError("max_tokens too large"), ok])
+    with pytest.raises(TimeoutError):
+        client.complete([{"role": "user", "content": "q"}], max_tokens=32000, timeout=0.15)
+    assert seen == [0.15]
+
+
+def test_http_fallback_passes_gateway_error_text_to_the_token_retry(monkeypatch):
+    import httpx
+    import core.llm as llm
+
+    monkeypatch.setattr(llm, "_OpenAI", None)
+    requested = []
+
+    def post(url, json=None, headers=None, timeout=None):
+        requested.append(json["max_tokens"])
+        request = httpx.Request("POST", url)
+        if len(requested) == 1:
+            return httpx.Response(400, json={"error": {"message": "max_tokens must be at most 16384"}}, request=request)
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": "answer"}}]},
+                              request=request)
+
+    monkeypatch.setattr(llm.httpx, "post", post)
+    client = llm.ModelClient("http://gateway.invalid/v1", "k", "m")
+    assert client.complete([{"role": "user", "content": "q"}], max_tokens=32000, timeout=30) == "answer"
+    assert requested == [32000, 16000]
