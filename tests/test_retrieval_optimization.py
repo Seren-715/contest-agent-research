@@ -249,13 +249,11 @@ def test_query_expansion_retries_once_then_gives_up_with_warning(caplog):
     assert "B query expansion produced no keywords" in caplog.text
 
 
-def test_all_model_failures_fall_back_to_labelled_lexical_matches_without_constraints(settings, tmp_path, monkeypatch):
+def test_all_model_failures_do_not_return_unverified_lexical_matches(settings, tmp_path, monkeypatch):
     _corpus(monkeypatch, tmp_path, count=2)
-    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
-                                       settings, FakeClient(["bad JSON"]))
-    assert len(result["papers"]) == 2
-    assert all("未经语义复核" in item["reason"] for item in result["papers"])
-    validate_answer("Literature_Retrieval", result)
+    with pytest.raises(HandlerError, match="before any valid"):
+        RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
+                                  settings, FakeClient(["bad JSON"]))
 
 
 def test_returned_name_is_matched_case_insensitively_and_emitted_canonically(settings, tmp_path, monkeypatch):
@@ -285,14 +283,9 @@ def test_translated_keywords_rank_independently_of_the_cjk_query():
     "自适应解码 语言推理 2022年以后的论文",
     "自适应解码 语言推理，仅限使用公开数据集",
     "adaptive decoding language inference at least 7B parameters",
+    "adaptive decoding language inference during the last five years",
 ])
 def test_lexical_fallback_is_refused_when_the_query_states_a_condition(settings, tmp_path, monkeypatch, query):
     _corpus(monkeypatch, tmp_path, count=2)
     with pytest.raises(HandlerError, match="before any valid"):
         RetrievalHandler().handle({"case_id": "B-01", "input": query}, settings, FakeClient(["bad JSON"]))
-
-
-def test_plain_topic_words_do_not_count_as_conditions():
-    from handlers.b_retrieval import CONSTRAINT_RE
-    for query in ("非线性系统的自适应控制", "检索增强生成方法", "adaptive decoding for language inference"):
-        assert not CONSTRAINT_RE.search(query), query

@@ -370,6 +370,7 @@ def index_materials(
         warnings: list[str] = []
         spans: list[EvidencePassage] = []
         indexed: list[int] = []
+        attempted_pages = 0
         pages: Optional[int] = None
         size = path.stat().st_size if path.is_file() else 0
         digest = ""
@@ -398,13 +399,14 @@ def index_materials(
                 for number in selected:
                     check_active()
                     now = time.monotonic()
-                    # The per-file share starts limiting only after one page:
+                    # The per-file share starts limiting after one attempt:
                     # hashing and PdfReader setup can exceed the share on their
                     # own, which used to leave a readable file with no text.
-                    # The overall budget is never exceeded.
-                    if now - started >= seconds or (indexed and now - file_started >= file_seconds):
+                    # Individual parsing calls cannot be interrupted here.
+                    if now - started >= seconds or (attempted_pages and now - file_started >= file_seconds):
                         warnings.append("index_time_limit")
                         break
+                    attempted_pages += 1
                     try:
                         raw = reader.pages[number].extract_text() or ""
                     except Exception:

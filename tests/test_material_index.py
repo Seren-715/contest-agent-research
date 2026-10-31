@@ -367,3 +367,36 @@ def test_slow_reader_setup_still_indexes_at_least_one_page(tmp_path, monkeypatch
     assert records[0].indexed_pages == (1,)
     assert all(record.text.strip() for record in records)
     assert clock[0] <= 9.0
+
+
+def test_failed_page_attempt_respects_file_share_and_preserves_later_files(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("core.paperlib.time.monotonic", lambda: clock[0])
+    monkeypatch.setenv("CONTEST_INDEX_SECONDS", "6")
+
+    class Page:
+        def __init__(self, broken):
+            self.broken = broken
+
+        def extract_text(self):
+            if self.broken:
+                clock[0] += 2.0
+                raise ValueError("bad page")
+            return "Readable paper evidence."
+
+    class Reader:
+        def __init__(self, path):
+            self.pages = [Page(Path(path).name == "a.pdf") for _ in range(3)]
+
+    monkeypatch.setattr("core.paperlib.PdfReader", Reader)
+    paths = []
+    for name in ("a.pdf", "b.pdf", "c.pdf"):
+        path = tmp_path / name
+        path.write_bytes(b"%PDF-")
+        paths.append(path)
+    records = index_materials(paths)
+    assert records[0].indexed_pages == ()
+    assert "page_extract_failed:1" in records[0].warnings
+    assert "page_extract_failed:2" not in records[0].warnings
+    assert "index_time_limit" in records[0].warnings
+    assert all(record.text.strip() for record in records[1:])
