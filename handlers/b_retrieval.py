@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,15 +35,16 @@ SYSTEM = (
     "只输出一个 JSON 对象，不要加代码围栏。"
 )
 LOGGER = logging.getLogger(__name__)
+EXCLUSION_RE = re.compile(r"exclud|without|except|not\s+requir|排除|除外|不含|不包括|不涉及|不使用|不要", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class RetrievalLimits:
     """Operational budgets, not a requirement to return a fixed number of hits."""
 
-    candidates: int = 80
+    candidates: int = 128
     batch_size: int = 16
-    batches: int = 5
+    batches: int = 8
     results: int = 80
     excerpt_chars: int = 1400
 
@@ -122,22 +124,32 @@ def _looks_like_pdf(path: Path) -> bool:
         return False
 
 
-def _rank_records(query: str, records: list[MaterialRecord]) -> list[tuple[MaterialRecord, float]]:
-    """Fuse document and best-passage ranks after deduplicating at paper level."""
+def _rank_records(query: str, records: list[MaterialRecord],
+                  keywords: tuple[str, ...] = ()) -> list[tuple[MaterialRecord, float]]:
+    """Fuse document and best-passage ranks after deduplicating at paper level.
+
+    When translated keywords are available they form independent rankings, so
+    the (usually English) keywords are not diluted by the original CJK query.
+    """
     check_active()
     papers = [Paper(path=item.path, filename=item.filename, text=item.text) for item in records]
-    document_ranks = bm25_rank(query, papers, top_k=len(papers))
     passages = []
     for record in records:
         check_active()
         for passage in getattr(record, "passages", ()):
             passages.append(Paper(path=record.path, filename=record.filename, text=passage.text))
-    passage_ranks = bm25_rank(query, passages, top_k=len(passages)) if passages else []
+    queries = [query]
+    if keywords:
+        queries.append(" ".join(keywords))
+    rankings = []
+    for text in queries:
+        rankings.append(bm25_rank(text, papers, top_k=len(papers)))
+        rankings.append(bm25_rank(text, passages, top_k=len(passages)) if passages else [])
     check_active()
     # One paper contributes once to each ranking; repeated chunks cannot fill
     # the candidate pool. RRF avoids comparing scores across different lengths.
     scores: dict[str, float] = {}
-    for ranking in (document_ranks, passage_ranks):
+    for ranking in rankings:
         seen = set()
         for paper, value in ranking:
             key = paper.filename.casefold()
@@ -186,11 +198,13 @@ class RetrievalHandler:
         if not records:
             raise HandlerError("retrieval materials have no extractable evidence")
         search_text = query
+        keywords: list[str] = []
         if _has_cjk(query):
             keywords = _expand_query(client, query, deadline, settings.request_timeout)
             if keywords:
                 search_text = query + " " + " ".join(keywords)
-        ranked = _rank_records(search_text, records)
+        record_stage(settings, case_id, "query_expanded", cjk=_has_cjk(query), keyword_count=len(keywords))
+        ranked = _rank_records(query, records, tuple(keywords))
         capacity = min(limits.candidates, limits.batch_size * limits.batches)
         candidates = ranked[:capacity]
         if len(ranked) > capacity:
@@ -204,11 +218,12 @@ class RetrievalHandler:
         prompt_suffix = (
             "\n\n请按相关性从高到低返回本批所有有证据支持且符合约束的论文；没有则返回空数组，"
             "不要求凑够篇数，也没有固定5篇限制。判定规则：\n"
-            "1. 每篇必须覆盖检索需求中的至少两个具体要素（主题、方法、数据、任务或结论）；\n"
+            "1. 论文的核心主题、方法或任务与检索需求直接相关即可返回，不要求覆盖需求中的每个要素；\n"
             "2. 只共享 paper/study/method 这类泛词、没有实质主题重合的论文不要返回；\n"
-            "3. 误报会按每篇扣分，漏掉真正相关的论文也会扣分；不确定时保留覆盖多个要素的论文；\n"
+            "3. 漏掉真正相关的论文和返回无关论文都会扣分，但命中一篇的收益明显高于一次误报的代价；"
+            "主题明确相关而证据摘录不完整时，应保留；\n"
             "4. 必须满足排除条件、时间范围、数据集和任务等硬约束；相关主题但违反约束也不要返回；\n"
-            "5. reason 要具体说明覆盖了哪些检索要素和原文依据，不能只写“相关”。\n"
+            "5. reason 要具体说明论文与检索需求的对应关系和原文依据，不能只写“相关”。\n"
             "只输出 JSON：{\"papers\":[{\"filename\":\"...\",\"reason\":\"...\"}]}。"
         )
         hits: list[dict[str, str]] = []
@@ -216,11 +231,11 @@ class RetrievalHandler:
         successful_batches = 0
         for offset in range(0, len(candidates), limits.batch_size):
             check_active()
-            if deadline.remaining() < 2:
+            if deadline.remaining() < 15:
                 LOGGER.warning("B rerank stopped at deadline after %d candidates", offset)
                 break
             batch = candidates[offset:offset + limits.batch_size]
-            names = {record.filename for record, _ in batch}
+            names = {record.filename.casefold(): record.filename for record, _ in batch}
             listing = []
             for index, (record, value) in enumerate(batch, start=1):
                 excerpt = evidence_excerpt(record, query=search_text, max_chars=limits.excerpt_chars)
@@ -249,10 +264,14 @@ class RetrievalHandler:
             for item in raw_hits:
                 if not isinstance(item, dict):
                     continue
-                filename = str(item.get("filename", "")).strip()
                 reason = str(item.get("reason", "")).strip()
-                key = filename.casefold()
-                if filename not in names or key in seen or not reason:
+                key = str(item.get("filename", "")).strip().casefold()
+                # The platform matches file names case-insensitively; always
+                # emit the real file name, never the model's spelling of it.
+                filename = names.get(key, "")
+                if not filename or key in seen or not reason:
+                    if key and key not in names:
+                        LOGGER.warning("B dropped a returned name that is not in the batch")
                     continue
                 seen.add(key)
                 hits.append({"filename": filename, "reason": reason})
@@ -262,5 +281,19 @@ class RetrievalHandler:
                 LOGGER.warning("B output budget reached: %d papers", limits.results)
                 break
         if not successful_batches:
-            raise HandlerError("retrieval failed before any valid rerank response")
+            # Every model call failed. An unanswered case scores nothing, so
+            # return the top lexical matches, labelled as unreviewed. The
+            # reason quotes only indexed text; it claims no model judgement.
+            # Lexical overlap cannot judge exclusions or other hard constraints,
+            # so those cases still fail rather than guess.
+            constrained = bool(extra) or bool(EXCLUSION_RE.search(query))
+            fallback = [] if constrained else [(record, value) for record, value in candidates if value > 0][:5]
+            if not fallback:
+                raise HandlerError("retrieval failed before any valid rerank response")
+            record_stage(settings, case_id, "lexical_fallback", count=len(fallback))
+            LOGGER.warning("B model rerank unavailable; returning %d lexically ranked papers", len(fallback))
+            for record, _ in fallback:
+                quote = " ".join(evidence_excerpt(record, query=search_text, max_chars=240).split())
+                hits.append({"filename": record.filename,
+                             "reason": "模型复核不可用，仅按检索词在原文中的命中排序选出，未经语义复核。原文摘录：" + quote})
         return {"case_id": case_id, "papers": hits}

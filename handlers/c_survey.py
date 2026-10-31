@@ -29,6 +29,8 @@ SYSTEM = (
     "不要编造页码、数字、作者或文献。"
 )
 
+EVIDENCE_TOTAL_CHARS = 54000
+
 CLAIM_RULES = (
     "证据规则（必须逐条遵守）：\n"
     "1. 每一句包含事实、数字、方法、数据集、指标或结论的话，句末都必须有 [编号]；\n"
@@ -37,6 +39,44 @@ CLAIM_RULES = (
     "4. 参考文献条目必须逐字包含完整 PDF 文件名，编号与正文一致；\n"
     "5. 每篇指定论文都必须至少在正文引用一次。"
 )
+
+
+FACT_CHECK_MIN_SECONDS = 150
+
+
+def _fact_check(complete, base_prompt: str, markdown: str, records, settings: Settings, case_id: str) -> str:
+    """One extra pass: re-check every specific claim against the same excerpts.
+
+    The structural audit cannot tell whether a cited sentence is supported, so
+    unsupported specifics are removed or softened by a model that sees the
+    original evidence again. The revision is kept only if the structural gate
+    is no worse and the report did not collapse.
+    """
+    record_stage(settings, case_id, "fact_check")
+    review = (
+        "【逐句事实核对】\n"
+        "请对照上方论文摘录，逐句检查草稿中的数字、数据集、指标、方法归因、比较结论和实验条件。"
+        "某句话的任一要素在其所引论文的摘录中找不到直接依据（数字相同但方法、数据集、指标、单位或条件不符也算不支持），"
+        "就删除该句，或改写为摘录能直接确认的较弱表述，或标明“未核验”。"
+        "不要新增摘录之外的事实；保留有依据的句子、[编号] 引用、章节、对比表和 '## 参考文献'，每篇论文仍须被引用。"
+        "返回完整修订版 Markdown，不要说明修改了什么。"
+    )
+    try:
+        candidate = complete(
+            [{"role": "system", "content": SYSTEM}, {"role": "user", "content": base_prompt},
+             {"role": "assistant", "content": markdown}, {"role": "user", "content": review}],
+            0.1,
+        ).strip()
+    except (ModelError, TimeoutError):
+        check_active()
+        logging.getLogger(__name__).warning("survey_fact_check_failed case_id=%s", case_id)
+        return markdown
+    before = len(audit(markdown, records, "Survey").blockers)
+    after = len(audit(candidate, records, "Survey").blockers)
+    if after <= before and len(candidate) >= 0.5 * len(markdown):
+        return candidate
+    logging.getLogger(__name__).warning("survey_fact_check_rejected case_id=%s before=%d after=%d", case_id, before, after)
+    return markdown
 
 
 class SurveyHandler:
@@ -56,9 +96,12 @@ class SurveyHandler:
             # Keep the original query-ranked evidence, and supplement it with
             # diverse facet windows. Either strategy alone can miss relevant
             # sections; both windows contain only verbatim indexed text.
-            per_paper = min(1800, max(120, 9000 // len(paths)))
+            # Larger evidence budget: short windows rarely carried method,
+            # dataset, metric and condition together, which numeric claims need.
+            per_paper = min(2400, max(300, 14000 // len(paths)))
             base, records = materials_bundle(paths, query=query, max_chars=per_paper, deadline=deadline)
-            matrix = survey_evidence_matrix(records, query=query, max_total_chars=max(6000, 36000 - len(base) - 100))
+            matrix = survey_evidence_matrix(records, query=query,
+                                            max_total_chars=max(9000, EVIDENCE_TOTAL_CHARS - len(base) - 100))
             block = base + "\n\n补充原文窗口（候选维度仅用于定位）：\n" + matrix
         record_stage(settings, case_id, "evidence_ready", record_count=len(records), evidence_chars=len(block))
         extra = constraints_text(question)
@@ -75,7 +118,9 @@ class SurveyHandler:
             "结果与比较、局限六维整理各论文事实，再写综述。缺失信息明确未核验，不补造。"
             "具体数值须同时核对方法、数据集、单位、指标、实验条件和比较对象；"
             "原文存在同一数字不等于支持该事实。尽量覆盖各篇论文的具体贡献和条件，"
-            "不要仅写少量正确但空泛的背景。只有真实定位的页码才可引用。\n\n"
+            "不要仅写少量正确但空泛的背景。宁可少写数字，也不要写无法逐项对上原文条件的数字；"
+            "对比表单元格只写摘录能直接确认的内容，无法确认写“未核验”。"
+            "只有真实定位的页码才可引用。\n\n"
             f"{CLAIM_RULES}\n\n"
             "请写一篇正文 800～5000 字符（建议约3500）的中文 Markdown 综述，要求：\n"
             "正文排除标题行及参考文献节，空格、标点和内部换行计入；正文数字引用标记最多40组，"
@@ -123,6 +168,8 @@ class SurveyHandler:
                 # neither an upstream retry failure nor uncertainty erases it.
                 check_active()
                 logging.getLogger(__name__).warning("survey_repair_failed case_id=%s", case_id)
+        if os.environ.get("CONTEST_SURVEY_FACT_CHECK", "1") != "0" and deadline.remaining() >= FACT_CHECK_MIN_SECONDS:
+            markdown = _fact_check(complete, base_prompt, markdown, records, settings, case_id)
         return finalize(
             settings,
             "Survey",

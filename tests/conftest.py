@@ -34,6 +34,12 @@ class FakeClient:
         }
 
 
+@pytest.fixture(autouse=True)
+def _survey_fact_check_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Call-count tests target one behaviour at a time; the fact-check pass has its own tests."""
+    monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "0")
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     data = tmp_path / "data"
