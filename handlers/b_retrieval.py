@@ -62,13 +62,26 @@ def _has_cjk(text: str) -> bool:
     return any("一" <= char <= "鿿" for char in text)
 
 
-def _expand_query(client: ModelClient, query: str, deadline: Deadline, timeout: float) -> list[str]:
+def _expand_query(client: ModelClient, query: str, deadline: Deadline, timeout: float,
+                  attempts: int = 2) -> list[str]:
     """Translate a Chinese search request into English keywords.
 
     The local paper library is often English while the contest query is Chinese.
     Keyword ranking alone would miss everything; this is a cheap bridge before
-    the LLM rerank.
+    the LLM rerank. One retry is allowed because a failed expansion silently
+    degrades ranking to filename order; each failure is logged.
     """
+    for attempt in range(1, attempts + 1):
+        if attempt > 1 and deadline.remaining() < 30:
+            break
+        values = _expand_query_once(client, query, deadline, timeout)
+        if values:
+            return values
+        LOGGER.warning("B query expansion produced no keywords (attempt %d/%d)", attempt, attempts)
+    return []
+
+
+def _expand_query_once(client: ModelClient, query: str, deadline: Deadline, timeout: float) -> list[str]:
     try:
         text = client.complete(
             [
@@ -163,9 +176,13 @@ class RetrievalHandler:
             for warning in record.warnings:
                 kind = warning.split(":", 1)[0]
                 warning_counts[kind] = warning_counts.get(kind, 0) + 1
+        indexed_count = len(records)
         records = [record for record in records if record.text.strip()]
+        if len(records) < indexed_count:
+            LOGGER.warning("B dropped %d of %d PDFs without extractable text: %s",
+                           indexed_count - len(records), indexed_count, warning_counts)
         record_stage(settings, case_id, "evidence_ready", resolved_count=len(paths), readable_count=len(records),
-                     warning_counts=warning_counts)
+                     unreadable_count=indexed_count - len(records), warning_counts=warning_counts)
         if not records:
             raise HandlerError("retrieval materials have no extractable evidence")
         search_text = query

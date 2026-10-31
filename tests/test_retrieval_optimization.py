@@ -219,3 +219,30 @@ def test_real_model_client_accepts_and_forwards_retrieval_timeouts(settings, tmp
     assert len(result["papers"]) == 1
     assert len(timeouts) == 2
     assert all(0 < timeout <= settings.request_timeout for timeout in timeouts)
+
+
+def test_query_expansion_retries_once_then_gives_up_with_warning(caplog):
+    from core.budget import Deadline
+    from handlers.b_retrieval import _expand_query
+
+    class Flaky:
+        def __init__(self, replies):
+            self.replies = list(replies)
+            self.calls = 0
+
+        def complete(self, *args, **kwargs):
+            self.calls += 1
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    recovered = Flaky([RuntimeError("upstream"), '{"keywords":["adaptive","decoding"]}'])
+    assert _expand_query(recovered, "自适应解码", Deadline(300), 30) == ["adaptive", "decoding"]
+    assert recovered.calls == 2
+
+    failing = Flaky(["not json", "still not json"])
+    with caplog.at_level("WARNING"):
+        assert _expand_query(failing, "自适应解码", Deadline(300), 30) == []
+    assert failing.calls == 2
+    assert "B query expansion produced no keywords" in caplog.text

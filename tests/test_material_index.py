@@ -311,3 +311,30 @@ def test_directory_mount_with_same_basename_in_different_relative_path_is_ambigu
     monkeypatch.setenv("DATA_PATH", str(mount))
     with pytest.raises(MaterialResolutionError, match="ambiguous"):
         resolve_materials(["data/papers"], data)
+
+
+def test_slow_early_file_cannot_starve_later_files_of_index_time(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("core.paperlib.time.monotonic", lambda: clock[0])
+    monkeypatch.setenv("CONTEST_INDEX_SECONDS", "6")
+
+    class SlowPage:
+        def extract_text(self):
+            clock[0] += 1.0  # every page costs one simulated second
+            return "Evidence text for this page of the study."
+
+    class SlowReader:
+        def __init__(self, *_):
+            self.pages = [SlowPage() for _ in range(10)]
+
+    monkeypatch.setattr("core.paperlib.PdfReader", SlowReader)
+    paths = []
+    for name in ("a.pdf", "b.pdf", "c.pdf"):
+        path = tmp_path / name
+        path.write_bytes(b"%PDF-")
+        paths.append(path)
+    records = index_materials(paths)
+    # Without a per-file share, a.pdf would consume the whole 6 s budget.
+    assert all(record.text.strip() for record in records)
+    assert all("index_budget_exhausted" not in record.warnings for record in records)
+    assert all("index_time_limit" in record.warnings for record in records)

@@ -359,8 +359,14 @@ def index_materials(
         raise ValueError("unknown PDF page selection")
     started = time.monotonic()
     records: list[MaterialRecord] = []
-    for path in paths:
+    paths = list(paths)
+    for position, path in enumerate(paths):
         check_active()
+        # Fair share of the remaining time: a slow early file cannot starve
+        # every later file (paths are in filename order). Unused time carries
+        # forward, and the last file may use whatever remains.
+        file_started = time.monotonic()
+        file_seconds = max(0.0, seconds - (file_started - started)) / (len(paths) - position)
         warnings: list[str] = []
         spans: list[EvidencePassage] = []
         indexed: list[int] = []
@@ -391,7 +397,8 @@ def index_materials(
                 per_page = min(12000, min(char_limit, total_chars) // max(1, len(selected)))
                 for number in selected:
                     check_active()
-                    if time.monotonic() - started >= seconds:
+                    now = time.monotonic()
+                    if now - started >= seconds or now - file_started >= file_seconds:
                         warnings.append("index_time_limit")
                         break
                     try:
