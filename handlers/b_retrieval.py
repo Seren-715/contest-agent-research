@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,18 +34,6 @@ SYSTEM = (
     "只输出一个 JSON 对象，不要加代码围栏。"
 )
 LOGGER = logging.getLogger(__name__)
-# Any hint of a condition (exclusion, time range, "only"/"must", thresholds)
-# disables the lexical fallback: word overlap cannot verify conditions, so a
-# conservative false positive here only means returning an error instead.
-CONSTRAINT_RE = re.compile(
-    r"exclud|without|except|not\s+(?:use|using|requir|includ|involv)|"
-    r"\bonly\b|\bmust\b|\brequir|\bat\s+(?:least|most)\b|\b(?:after|before|since|between|until|prior\s+to)\b|"
-    r"\bpublished\b|\b(?:19|20)\d{2}\b|"
-    r"排除|除外|不含|不包括|不涉及|不使用|不要|不能|不得|"
-    r"仅|只|必须|要求|限定|限于|至少|至多|不少于|不超过|不低于|不高于|满足|符合|条件|"
-    r"以后|之后|以前|之前|以来|期间|年份|年度|近\s*\d+\s*年|最近|\d{4}\s*年",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -376,19 +363,7 @@ class RetrievalHandler:
                 LOGGER.warning("B output budget reached: %d papers", limits.results)
                 break
         if not successful_batches:
-            # Every model call failed. An unanswered case scores nothing, so
-            # return the top lexical matches, labelled as unreviewed. The
-            # reason quotes only indexed text; it claims no model judgement.
-            # Lexical overlap cannot judge exclusions, time ranges or other
-            # conditions, so any sign of one makes the case fail, not guess.
-            constrained = bool(extra) or bool(CONSTRAINT_RE.search(query))
-            fallback = [] if constrained else [(record, value) for record, value in candidates if value > 0][:5]
-            if not fallback:
-                raise HandlerError("retrieval failed before any valid rerank response")
-            record_stage(settings, case_id, "lexical_fallback", count=len(fallback))
-            LOGGER.warning("B model rerank unavailable; returning %d lexically ranked papers", len(fallback))
-            for record, _ in fallback:
-                quote = " ".join(evidence_excerpt(record, query=search_text, max_chars=240).split())
-                hits.append({"filename": record.filename,
-                             "reason": "模型复核不可用，仅按检索词在原文中的命中排序选出，未经语义复核。原文摘录：" + quote})
+            # Lexical overlap cannot establish relevance or verify arbitrary
+            # conditions, regardless of how the query is phrased.
+            raise HandlerError("retrieval failed before any valid rerank response")
         return {"case_id": case_id, "papers": hits}
