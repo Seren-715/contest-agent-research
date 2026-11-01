@@ -121,6 +121,7 @@ def test_later_selection_batch_failure_keeps_prior_evidence(settings, tmp_path, 
                for i in range(50)]
     monkeypatch.setattr("core.materials.resolve_materials", lambda *args, **kwargs: [r.path for r in records])
     monkeypatch.setattr("core.materials.index_materials", lambda *args, **kwargs: records)
+    monkeypatch.setenv("CONTEST_SELECT_BATCH", "40")
     class TwoBatches:
         calls = 0
         def complete(self, *args, **kwargs):
@@ -135,3 +136,129 @@ def test_later_selection_batch_failure_keeps_prior_evidence(settings, tmp_path, 
     receipt = json.loads((settings.team_dir / "work/materials/C-01.json").read_text(encoding="utf-8"))
     assert receipt["processed_candidates"] == 40
     assert receipt["candidate_coverage_complete"] is False
+
+
+def _library(tmp_path, monkeypatch, designated=5, others=100):
+    from core.paperlib import MaterialRecord
+    records = []
+    for i in range(others):
+        path = tmp_path / "论文库" / "misc" / f"a{i:03d}.pdf"
+        records.append(MaterialRecord(path, path.name, "a" * 64, 100, 1, "Botany", "Forest",
+                                      "Botany observations of tropical forests."))
+    for i in range(designated):
+        path = tmp_path / "论文库" / "battery_recycling" / f"z{i}.pdf"
+        records.append(MaterialRecord(path, path.name, "b" * 64, 100, 1, "Battery recycling", "Hydrometallurgy",
+                                      "Hydrometallurgical recycling of lithium-ion batteries."))
+    monkeypatch.setattr("core.materials.resolve_materials", lambda *args, **kwargs: [r.path for r in records])
+    monkeypatch.setattr("core.materials.index_materials", lambda *args, **kwargs: records)
+    return records
+
+
+def test_selection_shows_every_paper_with_its_folder_and_the_task_title(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch)
+    designated = [r for r in records if r.filename.startswith("z")]
+
+    class Picker:
+        prompts = []
+
+        def complete(self, messages, **kwargs):
+            self.prompts.append(messages[-1]["content"])
+            return choice([r.path for r in designated])
+
+    client = Picker()
+    paths = select_report_materials(
+        {"case_id": "C-01", "title": "电动汽车电池回收：回收工艺与生命周期评估综述",
+         "input": "阅读本题指定论文，撰写综述，列出至少 5 篇实际引用的指定论文。",
+         "materials": ["本地论文文件夹内指定的电池回收 PDF"]}, settings, client, Deadline(900))
+    assert paths == [r.path for r in designated]
+    prompt = client.prompts[0]
+    assert len(client.prompts) == 1
+    # Chinese task, English papers: no BM25 cut-off may drop the designated, alphabetically last papers.
+    assert all(r.filename in prompt for r in records)
+    assert "battery_recycling/z0.pdf" in prompt
+    assert "电动汽车电池回收" in prompt and "通常指定 5 篇" in prompt
+
+
+def test_selection_is_never_trimmed_even_against_an_incomplete_count(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch, designated=10)
+    picked = [r.path for r in records if r.filename.startswith("z")]
+    for task in ("综述，至少 5 篇指定论文", "Use at least 5 papers and at least 10 peer-reviewed papers"):
+        paths = select_report_materials({"case_id": "C-01", "input": task,
+                                         "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                        settings, FakeClient([choice(picked)]), Deadline(900))
+        assert paths == picked
+
+
+@pytest.mark.parametrize("question,expected", [
+    ({"input": "列出至少 5 篇实际引用的指定论文"}, 5),
+    ({"input": "至少6篇"}, 6),
+    ({"input": "比较 4 篇指定论文"}, 4),
+    ({"input": "撰写综述"}, None),
+    ({"input": "撰写综述", "constraints": ["参考文献至少十篇"]}, 10),
+    ({"input": "比较十二篇指定论文"}, 12),
+    ({"input": "至少两篇"}, 2),
+    ({"input": "至少 5 篇", "constraints": ["至少引用十篇指定论文"]}, 10),
+    ({"input": "Cite at least 8 papers"}, 8),
+    ({"input": "Use at least 5 papers and at least 10 peer-reviewed papers"}, 10),
+])
+def test_required_count_is_read_from_the_task(question, expected):
+    from core.materials import _required_count
+    assert _required_count(question) == expected
+
+
+def test_stated_requirement_of_ten_keeps_all_ten_selected_papers(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch, designated=10)
+    picked = [r.path for r in records if r.filename.startswith("z")]
+
+    class Picker:
+        prompts = []
+
+        def complete(self, messages, **kwargs):
+            self.prompts.append(messages[-1]["content"])
+            return choice(picked)
+
+    client = Picker()
+    paths = select_report_materials({"case_id": "C-01", "input": "撰写电池回收综述",
+                                     "constraints": ["参考文献至少十篇指定论文"],
+                                     "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                    settings, client, Deadline(900))
+    assert paths == picked
+    assert "通常指定 10 篇" in client.prompts[0]
+
+
+def test_unstated_requirement_never_trims_the_model_selection(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch, designated=9)
+    picked = [r.path for r in records if r.filename.startswith("z")]
+    paths = select_report_materials({"case_id": "C-01", "input": "撰写电池回收综述",
+                                     "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                    settings, FakeClient([choice(picked)]), Deadline(900))
+    assert paths == picked
+
+
+def test_idea_gets_a_second_repair_and_keeps_the_draft_with_fewest_blockers(paper_settings):
+    from handlers.e_idea import IdeaHandler
+    settings, paths = paper_settings
+    good = _markdown([p.name for p in paths])
+    too_long = good.replace("## 参考文献", "补充说明。" * 1500 + "\n\n## 参考文献")
+    client = FakeClient([too_long, too_long, good])
+    payload = IdeaHandler().handle({"case_id": "E-01", "input": "提出城市绿地温度研究方案",
+                                    "materials": [str(p) for p in paths]}, settings, client)
+    assert len(client.calls) == 3
+    assert "800～4500字符" in client.calls[1][-1]["content"]
+    assert payload["markdown"].strip() == good.strip()
+
+
+def test_second_idea_repair_uses_the_kept_draft_not_the_rejected_revision(paper_settings):
+    from handlers.e_idea import IdeaHandler
+    settings, paths = paper_settings
+    good = _markdown([p.name for p in paths])
+    too_long = good.replace("## 参考文献", "补充说明。" * 1500 + "\n\n## 参考文献")  # one blocker
+    worse = "## 引言\n很短的修订稿。"  # rejected: more blockers than the kept draft
+    client = FakeClient([too_long, worse, good])
+    payload = IdeaHandler().handle({"case_id": "E-01", "input": "提出城市绿地温度研究方案",
+                                    "materials": [str(p) for p in paths]}, settings, client)
+    second = client.calls[2]
+    assert second[-2] == {"role": "assistant", "content": too_long.strip()}
+    assert "Idea maximum" in second[-1]["content"]          # the kept draft's own audit
+    assert worse not in "".join(message["content"] for message in second)
+    assert payload["markdown"].strip() == good.strip()

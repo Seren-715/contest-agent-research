@@ -14,6 +14,7 @@ import math
 import os
 import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -370,6 +371,7 @@ def index_materials(
         warnings: list[str] = []
         spans: list[EvidencePassage] = []
         indexed: list[int] = []
+        attempted_pages = 0
         pages: Optional[int] = None
         size = path.stat().st_size if path.is_file() else 0
         digest = ""
@@ -398,9 +400,14 @@ def index_materials(
                 for number in selected:
                     check_active()
                     now = time.monotonic()
-                    if now - started >= seconds or now - file_started >= file_seconds:
+                    # The per-file share starts limiting after one attempt:
+                    # hashing and PdfReader setup can exceed the share on their
+                    # own, which used to leave a readable file with no text.
+                    # Individual parsing calls cannot be interrupted here.
+                    if now - started >= seconds or (attempted_pages and now - file_started >= file_seconds):
                         warnings.append("index_time_limit")
                         break
+                    attempted_pages += 1
                     try:
                         raw = reader.pages[number].extract_text() or ""
                     except Exception:
@@ -518,10 +525,93 @@ def _paper_roots(settings_data_dir: Path) -> list[Path]:
 
 
 class MaterialResolutionError(RuntimeError):
-    def __init__(self, message: str):
+    def __init__(self, message: str, *, skipped: Optional[dict] = None, shapes: Optional[dict] = None):
         logging.getLogger(__name__).warning("material_resolution_failed reason=%s", message.split(":", 1)[0])
         super().__init__(message)
+        # Diagnostic counts only (never file names): skip reasons and the
+        # shapes of the declared entries, see core/failure_code.py.
+        self.skipped = dict(skipped or {})
+        self.shapes = dict(shapes or {})
 
+
+def material_shape(value: object) -> str:
+    """Coarse form of a declared material, for diagnostics without names."""
+    if not isinstance(value, str) or not value.strip():
+        return "other"
+    text = value.strip()
+    path = Path(text)
+    if path.is_absolute():
+        return "absolute"
+    if path.parts and path.parts[0] == "data" and len(path.parts) > 1:
+        return "data_relative"
+    if len(path.parts) > 1:
+        return "relative"
+    if path.suffix.lower() == ".pdf":
+        return "pdf_name"
+    if path.suffix:
+        return "other_suffix"
+    return "cjk_name" if re.search(r"[\u4e00-\u9fff]", text) else "ascii_name"
+
+
+def _team_name() -> Optional[str]:
+    """This team's directory name, from the same variables as core.config."""
+    for key in ("RESEARCH_WORKSPACE_TEAM", "TEAM_ID", "CONTEST_TEAM"):
+        value = os.environ.get(key, "").strip()
+        if value and value not in (".", "..") and "/" not in value and "\\" not in value:
+            return value
+    return None
+
+
+def _is_team_dir(directory: Path) -> bool:
+    """Any team's workspace (it holds assigned/ or dispatch.json)."""
+    try:
+        return (directory / "assigned").is_dir() or (directory / "dispatch.json").is_file()
+    except OSError:
+        return False
+
+
+def _walk_dirs(start: Path, depth: int, own_team: Optional[Path]) -> list[Path]:
+    """Directories below ``start`` up to ``depth`` levels, never entering task
+    or output trees or another team's workspace."""
+    found: list[Path] = []
+    frontier = [(start, 0)]
+    while frontier:
+        directory, level = frontier.pop()
+        try:
+            children = sorted(child for child in directory.iterdir() if child.is_dir())
+        except OSError:
+            continue
+        for child in children:
+            if child.name.casefold() in _NOT_A_LIBRARY:
+                continue
+            if _is_team_dir(child) and (own_team is None or _lexical(child) != _lexical(own_team)):
+                continue
+            found.append(child)
+            if level + 1 < depth:
+                frontier.append((child, level + 1))
+    return found
+
+
+def _suffix_matches(path: Path, team_dirs: list[Path], depth: int = 2) -> list[Path]:
+    """The declared relative path inside this team's directory tree.
+
+    "data/论文库" may be mounted at /data/<team>/论文库. Only this team's
+    workspace is searched (never another team's), and only the complete
+    declared suffix matches. Callers still require a unique match.
+    """
+    parts = path.parts[1:] if path.parts and path.parts[0] == "data" and len(path.parts) > 1 else path.parts
+    if not parts:
+        return []
+    suffix = Path(*parts)
+    found: list[Path] = []
+    for team in dict.fromkeys(team_dirs):
+        if not team.is_dir():
+            continue
+        for directory in [team] + _walk_dirs(team, depth, team):
+            candidate = directory / suffix
+            if candidate.exists():
+                found.append(candidate)
+    return list(dict.fromkeys(found))
 
 def is_material_description(value: object) -> bool:
     """Identify a natural-language paper scope, never a missing concrete path.
@@ -549,6 +639,20 @@ def describe_material_scope(materials: object) -> list[str]:
     if not isinstance(values, list):
         return []
     return [value.strip() for value in values if is_material_description(value)]
+
+
+def material_exists(value: object, settings_data_dir: Path) -> bool:
+    """Whether a declaration names an existing file or directory.
+
+    Existing paths take precedence over description wording: a folder called
+    "指定论文" is a path. Uses the same lookup as resolve_materials().
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        return bool(resolve_materials([value], settings_data_dir))
+    except MaterialResolutionError:
+        return False
 
 
 def has_explicit_material_scope(materials: object) -> bool:
@@ -579,37 +683,137 @@ def _identical_materials(paths: list[Path]) -> bool:
     return bool(hashes[0]) and len(set(hashes)) == 1
 
 
+def _lexical(path: Path) -> Path:
+    return Path(os.path.abspath(str(path)))
+
+
+def _on_disk_case(path: Path) -> Path:
+    """On case-insensitive file systems a path "exists" in any letter case;
+    report the file name exactly as the directory stores it."""
+    try:
+        names = os.listdir(path.parent)
+    except OSError:
+        return path
+    if path.name in names:
+        return path
+    matches = [name for name in names if _fold_name(name) == _fold_name(path.name)]
+    return path.parent / matches[0] if len(matches) == 1 else path
+
+
+def _fold_name(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+_NOT_A_LIBRARY = {"experiments", "assigned", "expert", "figure", "work", "diagnostics"}
+
+
+def _library_like_dirs(bases: list[Path], team_dirs: list[Path], depth: int = 3) -> list[Path]:
+    """Library-like directories in the shared data roots (top level only) or
+    inside this team's workspace; never another team's workspace."""
+    pattern = re.compile(r"论文|文献|paper|pdf|literature", re.IGNORECASE)
+    candidates: list[Path] = []
+    for base in dict.fromkeys(bases):
+        if base.is_dir():
+            candidates.extend(_walk_dirs(base, 1, None))
+    for team in dict.fromkeys(team_dirs):
+        if team.is_dir():
+            candidates.extend(_walk_dirs(team, depth, team))
+    return list(dict.fromkeys(directory for directory in candidates if pattern.search(directory.name)))
+
 def resolve_materials(
     materials: object, settings_data_dir: Path, *, allow_library: bool = False,
-    allow_descriptions: bool = False,
+    allow_descriptions: bool = False, lenient: bool = False,
 ) -> list[Path]:
     """Resolve declared materials; description discovery needs explicit opt-in.
 
     Missing declarations never broaden scope. Ambiguous basenames are errors,
     not an invitation to pick whichever root happened to be searched first.
     Description-only discovery returns candidates, not a selected C/E corpus.
+    ``lenient`` (retrieval over a whole library) skips a missing or ambiguous
+    entry instead of failing the case; it never substitutes another file.
     """
+    skipped: list[str] = []
     roots = _paper_roots(settings_data_dir)
-    allowed = [settings_data_dir.resolve(), Path("/data").resolve()]
+    data_bases = [settings_data_dir, Path("/data")]
     if os.environ.get("DATA_PATH"):
-        allowed.append(Path(os.environ["DATA_PATH"]).resolve())
+        data_bases.append(Path(os.environ["DATA_PATH"]))
+    allowed = list(dict.fromkeys([_lexical(base) for base in data_bases] + [base.resolve() for base in data_bases]))
+
+    resolved_bases = list(dict.fromkeys(base.resolve() for base in data_bases))
+    team = _team_name()
+    team_dirs = [base / team for base in dict.fromkeys(data_bases) if team and (base / team).is_dir()]
+    # Searched by name: the shared libraries and this team's workspace only.
+    # A whole data root may hold other teams' directories and is never walked.
+    search_roots = [root for root in roots if root.name in ("论文库", "papers")] + team_dirs
 
     def within(path: Path) -> bool:
-        resolved = path.resolve()
-        return any(resolved == base or base in resolved.parents for base in allowed)
+        # Both the declared location and the real target (after symlinks) must
+        # lie inside a data root: the spec forbids symlinks that leave it.
+        lexical, resolved = _lexical(path), path.resolve()
+        return (any(lexical == base or base in lexical.parents for base in allowed)
+                and any(resolved == base or base in resolved.parents for base in resolved_bases))
 
     def checked(path: Path) -> Path:
         if not within(path):
             raise MaterialResolutionError(f"material outside allowed data roots: {path.name}")
-        return path.resolve()
+        # Keep the library's own (link) name, spelled as it is on disk.
+        return _on_disk_case(_lexical(path))
+
+    def accept(paths: Iterable[Path]) -> list[Path]:
+        """checked() for each path; whole-library retrieval skips escaping links."""
+        result: list[Path] = []
+        for value in paths:
+            if lenient and not within(value):
+                skipped.append("outside_roots")
+                continue
+            result.append(checked(value))
+        return result
+
+    folded_index: dict[str, list[Path]] = {}
+
+    def folded_matches(name: str) -> list[Path]:
+        """Case- and Unicode-insensitive filename lookup in the paper roots.
+
+        The spec treats names differing only in letter case as the same paper
+        and says to read the library's actual file name.
+        """
+        if not folded_index:
+            for root in search_roots:
+                if root.is_dir():
+                    for value in root.rglob("*"):
+                        if value.is_file():
+                            folded_index.setdefault(_fold_name(value.name), []).append(value)
+            folded_index.setdefault("", [])
+        # A same-named file whose real target leaves the data roots is not a match.
+        return [checked(value) for value in folded_index.get(_fold_name(name), []) if within(value)]
+
+    def folded_path_matches(path: Path) -> list[Path]:
+        # A declared directory part is part of the identity: compare the whole
+        # declared suffix (minus a leading "data/"), never just the basename.
+        parts = list(path.parts[1:] if path.parts and path.parts[0] == "data" and len(path.parts) > 1 else path.parts)
+        wanted = [_fold_name(part) for part in parts]
+        return [value for value in folded_matches(path.name)
+                if [_fold_name(part) for part in value.parts[-len(wanted):]] == wanted]
 
     def discover_library(*, descriptions_only: bool = False) -> list[Path]:
         declared: list[Path] = []
         libraries = [root for root in roots if root.name in ("论文库", "papers") and root.is_dir()]
-        for root in (libraries if descriptions_only else (libraries or roots)):
+        for root in (libraries if descriptions_only else (libraries or team_dirs)):
             if root.exists():
                 declared.extend(list_pdfs(root))
-        return [checked(path) for path in declared]
+        if not declared:
+            # The library may sit under the team directory or use another name.
+            for directory in _library_like_dirs(data_bases, team_dirs):
+                declared.extend(list_pdfs(directory))
+            if declared:
+                logging.getLogger(__name__).warning("material_library_fallback pdfs=%d", len(declared))
+        result: list[Path] = []
+        for path in declared:
+            if lenient and not within(path):
+                skipped.append("outside_roots")
+                continue
+            result.append(checked(path))
+        return result
 
     def identical_pdf_scopes(directories: list[Path]) -> bool:
         if not directories or any(not directory.is_dir() for directory in directories):
@@ -644,16 +848,11 @@ def resolve_materials(
         explicit_paper_scope = False
         for item in values:
             check_active()
-            if is_material_description(item):
-                if not allow_descriptions:
-                    raise MaterialResolutionError("descriptive material scope requires explicit selection")
-                descriptions.append(item)
-                continue
             path = Path(item)
             if ".." in path.parts:
                 raise MaterialResolutionError("material path contains parent traversal")
             if path.is_absolute():
-                found = [checked(path)] if path.exists() else []
+                found = accept([path]) if path.exists() else []
             else:
                 exact = [base / path for base in [settings_data_dir, settings_data_dir.parent] + roots]
                 # Questions use paths relative to the contest package, while
@@ -669,19 +868,43 @@ def resolve_materials(
                     if suffix.parts[0] in ("论文库", "papers") and len(suffix.parts) > 1:
                         exact.extend(root / Path(*suffix.parts[1:]) for root in roots
                                      if root.name == suffix.parts[0])
-                found = [checked(value) for value in exact if value.exists()]
+                found = accept(value for value in exact if value.exists())
                 if len(path.parts) == 1:
-                    found.extend(checked(value) for root in roots if root.exists()
-                                 for value in root.rglob("*") if value.name == path.name)
+                    found.extend(accept(value for root in search_roots if root.exists()
+                                        for value in root.rglob("*") if value.name == path.name))
             found = list(dict.fromkeys(found))
+            if not found and not path.is_absolute():
+                found = list(dict.fromkeys(accept(_suffix_matches(path, team_dirs))))
+                if found:
+                    logging.getLogger(__name__).warning("material_suffix_found matches=%d", len(found))
+            if not found and path.suffix:
+                found = list(dict.fromkeys(folded_path_matches(path)))
+                if found:
+                    logging.getLogger(__name__).warning("material_name_folded matches=%d", len(found))
+            # An existing file or directory always wins: a folder named
+            # "指定论文" is a path, not prose. Only an entry that matches
+            # nothing on disk may be a description, and only if it carries the
+            # explicit scope wording is_material_description() requires; any
+            # other missing entry stays not-found and never widens the scope.
+            if not found and is_material_description(item):
+                if not allow_descriptions:
+                    raise MaterialResolutionError("descriptive material scope requires explicit selection")
+                descriptions.append(item)
+                continue
             if not found:
+                if lenient:
+                    skipped.append("not_found")
+                    continue
                 raise MaterialResolutionError(f"declared material not found: {path.name}")
             if len(found) != 1 and not (_identical_materials(found) or identical_pdf_scopes(found)):
+                if lenient:
+                    skipped.append("ambiguous")
+                    continue
                 raise MaterialResolutionError(f"ambiguous declared material: {path.name}")
             value = found[0]
             if value.is_dir():
                 explicit_paper_scope = True
-                candidates.extend(checked(pdf) for pdf in list_pdfs(value))
+                candidates.extend(accept(list_pdfs(value)))
             elif value.is_file() and value.suffix.lower() == ".pdf":
                 explicit_paper_scope = True
                 candidates.append(value)
@@ -709,8 +932,18 @@ def resolve_materials(
         key = path.name.lower()
         if key in names:
             if names[key] != path and not _identical_materials([names[key], path]):
-                raise MaterialResolutionError(f"ambiguous PDF filename: {path.name}")
+                if not lenient:
+                    raise MaterialResolutionError(f"ambiguous PDF filename: {path.name}")
+                # Answers name papers by file name only; keep the first copy.
+                skipped.append("duplicate_name")
             continue
         names[key] = path
         unique.append(path)
+    if skipped:
+        logging.getLogger(__name__).warning("material_resolution_skipped %s", dict(Counter(skipped)))
+        if not unique:
+            raw = [materials] if isinstance(materials, str) else (materials if isinstance(materials, list) else [])
+            raise MaterialResolutionError(f"no declared material could be resolved: {dict(Counter(skipped))}",
+                                          skipped=dict(Counter(skipped)),
+                                          shapes=dict(Counter(material_shape(value) for value in raw)))
     return unique

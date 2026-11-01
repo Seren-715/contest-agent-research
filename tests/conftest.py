@@ -38,6 +38,8 @@ class FakeClient:
 def _survey_fact_check_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Call-count tests target one behaviour at a time; the fact-check pass has its own tests."""
     monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "0")
+    # The B failure timing code sleeps up to minutes; tests/test_failure_code.py covers it.
+    monkeypatch.setenv("CONTEST_FAILURE_TIMING", "0")
 
 
 @pytest.fixture

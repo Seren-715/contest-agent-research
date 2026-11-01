@@ -249,13 +249,11 @@ def test_query_expansion_retries_once_then_gives_up_with_warning(caplog):
     assert "B query expansion produced no keywords" in caplog.text
 
 
-def test_all_model_failures_fall_back_to_labelled_lexical_matches_without_constraints(settings, tmp_path, monkeypatch):
+def test_all_model_failures_do_not_return_unverified_lexical_matches(settings, tmp_path, monkeypatch):
     _corpus(monkeypatch, tmp_path, count=2)
-    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
-                                       settings, FakeClient(["bad JSON"]))
-    assert len(result["papers"]) == 2
-    assert all("未经语义复核" in item["reason"] for item in result["papers"])
-    validate_answer("Literature_Retrieval", result)
+    with pytest.raises(HandlerError, match="before any valid"):
+        RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
+                                  settings, FakeClient(["bad JSON"]))
 
 
 def test_returned_name_is_matched_case_insensitively_and_emitted_canonically(settings, tmp_path, monkeypatch):
@@ -277,3 +275,111 @@ def test_translated_keywords_rank_independently_of_the_cjk_query():
     other = make("other.pdf", "botany observations")
     ranked = _rank_records("自适应解码", [other, relevant], ("adaptive", "decoding"))
     assert ranked[0][0].filename == "english.pdf" and ranked[0][1] > 0
+
+
+@pytest.mark.parametrize("query", [
+    "adaptive decoding language inference published after 2022",
+    "adaptive decoding language inference, only on English benchmarks",
+    "自适应解码 语言推理 2022年以后的论文",
+    "自适应解码 语言推理，仅限使用公开数据集",
+    "adaptive decoding language inference at least 7B parameters",
+    "adaptive decoding language inference during the last five years",
+])
+def test_lexical_fallback_is_refused_when_the_query_states_a_condition(settings, tmp_path, monkeypatch, query):
+    _corpus(monkeypatch, tmp_path, count=2)
+    with pytest.raises(HandlerError, match="before any valid"):
+        RetrievalHandler().handle({"case_id": "B-01", "input": query}, settings, FakeClient(["bad JSON"]))
+
+
+class ScreenThenVerify:
+    """Screen keeps paper_x7 files; verify accepts everything it is shown."""
+
+    def __init__(self, fail_screen_batches=()):
+        self.screen_calls = []
+        self.verify_calls = []
+        self.fail_screen_batches = set(fail_screen_batches)
+
+    def complete(self, messages, **kwargs):
+        prompt = messages[-1]["content"]
+        if "宽松初筛" in prompt:
+            names = re.findall(r"^\d+\. (paper_\d+\.pdf)$", prompt, re.MULTILINE)
+            self.screen_calls.append(names)
+            if len(self.screen_calls) - 1 in self.fail_screen_batches:
+                raise RuntimeError("upstream unavailable")
+            return json.dumps({"papers": [{"filename": n} for n in names if n.endswith("7.pdf")]})
+        names = re.findall(r"\d+\. (paper_\d+\.pdf)（", prompt)
+        self.verify_calls.append(names)
+        return json.dumps({"papers": [{"filename": n, "reason": "正文研究自适应解码与语言推理吞吐量。"} for n in names]},
+                          ensure_ascii=False)
+
+
+def _large_corpus(monkeypatch, tmp_path, count=130):
+    paths = [tmp_path / ("paper_%03d.pdf" % index) for index in range(count)]
+    for path in paths:
+        path.write_bytes(b"%PDF-")
+    body = "Adaptive decoding for language inference throughput"
+    records = [MaterialRecord(path=p, filename=p.name, sha256="t", bytes=6, pages=1,
+                              title="Language inference", abstract=body, text=body) for p in paths]
+    monkeypatch.setattr("handlers.b_retrieval.resolve_materials", lambda *a, **kw: paths)
+    monkeypatch.setattr("handlers.b_retrieval.index_materials", lambda actual, **kwargs: records)
+    return paths
+
+
+def test_large_library_is_screened_once_per_paper_then_verified(settings, tmp_path, monkeypatch):
+    paths = _large_corpus(monkeypatch, tmp_path)
+    client = ScreenThenVerify()
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
+                                       settings, client)
+    screened = [name for call in client.screen_calls for name in call]
+    assert sorted(screened) == sorted(p.name for p in paths)  # every paper seen exactly once
+    assert len(client.screen_calls) == 2
+    expected = {p.name for p in paths if p.name.endswith("7.pdf")}
+    assert {name for call in client.verify_calls for name in call} == expected
+    assert len(client.verify_calls) == 1
+    assert {item["filename"] for item in result["papers"]} == expected
+    validate_answer("Literature_Retrieval", result)
+
+
+def test_failed_screen_batch_passes_its_papers_to_verification(settings, tmp_path, monkeypatch):
+    _large_corpus(monkeypatch, tmp_path)
+    client = ScreenThenVerify(fail_screen_batches={0})
+    RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
+    verified = {name for call in client.verify_calls for name in call}
+    assert set(client.screen_calls[0]) <= verified
+    assert {n for n in client.screen_calls[1] if n.endswith("7.pdf")} <= verified
+    assert not {n for n in client.screen_calls[1] if not n.endswith("7.pdf")} & verified
+
+
+def test_small_library_skips_the_screen(settings, tmp_path, monkeypatch):
+    _large_corpus(monkeypatch, tmp_path, count=30)
+    client = ScreenThenVerify()
+    RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
+    assert client.screen_calls == []
+    assert sum(len(call) for call in client.verify_calls) == 30
+
+
+def test_screen_out_of_time_passes_unscreened_papers_through(settings, tmp_path):
+    from handlers.b_retrieval import RetrievalLimits, _screen
+
+    def make(name):
+        return MaterialRecord(path=tmp_path / name, filename=name, sha256="t", bytes=1, pages=1,
+                              title=name, abstract="Adaptive decoding", text="Adaptive decoding")
+
+    ranked = [(make("first.pdf"), 1.0), (make("second.pdf"), 0.5)]
+
+    class Clock:
+        """Plenty of time for the first batch, then too little for another."""
+        def __init__(self):
+            self.values = [300.0, 10.0]
+
+        def remaining(self):
+            return self.values.pop(0) if len(self.values) > 1 else self.values[0]
+
+        def timeout(self, value, **kwargs):
+            return value
+
+    limits = RetrievalLimits(screen_batch=1)
+    client = FakeClient(['{"papers":[{"filename":"first.pdf"}]}'])
+    kept = _screen(client, "adaptive decoding", "", ranked, "adaptive decoding", limits, Clock(), settings, "B-01")
+    assert len(client.calls) == 1
+    assert kept == {"first.pdf", "second.pdf"}

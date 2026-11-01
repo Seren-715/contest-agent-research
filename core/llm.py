@@ -7,7 +7,10 @@ for AgentHack telemetry, with an HTTP fallback for local environments.
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -19,6 +22,23 @@ try:
     from openai import OpenAI as _OpenAI
 except ImportError:  # local venv may not have the SDK; httpx fallback still works
     _OpenAI = None
+
+
+_TOKEN_LIMIT_HINTS = ("max_tokens", "maximum", "context length", "too large", "out of range")
+
+
+def output_budget() -> int:
+    """Output-token cap for B/C/E calls (D keeps its own setting).
+
+    The contest model is a reasoning model: hidden thinking and the visible
+    answer share max_tokens. Small caps (400-6000) truncate the thinking and
+    leave no answer; docs/PLATFORM.md recorded the same failure for D at 16k.
+    A cap is an upper bound, not a target length.
+    """
+    value = int(os.environ.get("CONTEST_MAX_TOKENS", "32000"))
+    if value <= 0:
+        raise ValueError("CONTEST_MAX_TOKENS must be positive")
+    return value
 
 
 class ModelError(RuntimeError):
@@ -118,6 +138,11 @@ class ModelClient:
             )
             response.raise_for_status()
             body = response.json()
+        except httpx.HTTPStatusError as exc:
+            # Keep the gateway's error text: callers decide on retries from it
+            # (e.g. an output-token cap). Body only, never request headers.
+            detail = " ".join(exc.response.text.split())[:500]
+            raise ModelError(f"model request failed: HTTP {exc.response.status_code}: {detail}") from exc
         except httpx.HTTPError as exc:
             raise ModelError(f"model request failed: {exc}") from exc
         except ValueError as exc:
@@ -135,18 +160,39 @@ class ModelClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> str:
-        body = self.complete_raw(messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        started = time.monotonic()
+        try:
+            body = self.complete_raw(messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+        except ModelError as exc:
+            # A gateway may cap max_tokens; retry once at the cap D already uses.
+            if not (max_tokens and max_tokens > 16000 and any(h in str(exc).lower() for h in _TOKEN_LIMIT_HINTS)):
+                raise
+            check_active()
+            # The retry shares the caller's time budget; it never restarts it.
+            limit = self.timeout if timeout is None else min(self.timeout, timeout)
+            remaining = limit - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("no time remains for the model token-limit retry") from exc
+            body = self.complete_raw(messages, temperature=temperature, max_tokens=16000, timeout=remaining)
         choices = body.get("choices") or []
         if not choices:
             raise ModelError(f"model response has no choices: {body}")
+        finish_reason = choices[0].get("finish_reason")
         message = choices[0].get("message") or {}
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
+            if finish_reason == "length":
+                # Thinking consumed the whole budget. The reasoning trace is not
+                # an answer; using it would publish thoughts or break JSON.
+                raise ModelError("model output truncated (finish_reason=length) before any answer; "
+                                 "raise CONTEST_MAX_TOKENS")
             # Some reasoning models put the visible answer in reasoning_content
-            # when max_tokens is small; use it rather than returning empty.
+            # when it completed normally; use it rather than returning empty.
             reasoning = message.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning.strip():
                 content = reasoning
+        elif finish_reason == "length":
+            logging.getLogger(__name__).warning("model answer truncated (finish_reason=length, max_tokens=%s)", max_tokens)
         if not isinstance(content, str):
             raise ModelError("model response content is not a string")
         return content
