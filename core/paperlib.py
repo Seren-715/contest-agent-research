@@ -14,6 +14,7 @@ import math
 import os
 import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -583,29 +584,95 @@ def _identical_materials(paths: list[Path]) -> bool:
     return bool(hashes[0]) and len(set(hashes)) == 1
 
 
+def _lexical(path: Path) -> Path:
+    return Path(os.path.abspath(str(path)))
+
+
+def _fold_name(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+_NOT_A_LIBRARY = {"experiments", "assigned", "expert", "figure", "work", "diagnostics"}
+
+
+def _library_like_dirs(bases: list[Path], depth: int = 3) -> list[Path]:
+    """Directories whose name suggests a paper library, outside task/output trees."""
+    found: list[Path] = []
+    for base in dict.fromkeys(bases):
+        if not base.is_dir():
+            continue
+        frontier = [(base, 0)]
+        while frontier:
+            directory, level = frontier.pop()
+            try:
+                children = sorted(child for child in directory.iterdir() if child.is_dir())
+            except OSError:
+                continue
+            for child in children:
+                if child.name.casefold() in _NOT_A_LIBRARY:
+                    continue
+                if re.search(r"论文|文献|paper|pdf|literature", child.name, re.IGNORECASE):
+                    found.append(child)
+                elif level + 1 < depth:
+                    frontier.append((child, level + 1))
+    return list(dict.fromkeys(found))
+
+
 def resolve_materials(
     materials: object, settings_data_dir: Path, *, allow_library: bool = False,
-    allow_descriptions: bool = False,
+    allow_descriptions: bool = False, lenient: bool = False,
 ) -> list[Path]:
     """Resolve declared materials; description discovery needs explicit opt-in.
 
     Missing declarations never broaden scope. Ambiguous basenames are errors,
     not an invitation to pick whichever root happened to be searched first.
     Description-only discovery returns candidates, not a selected C/E corpus.
+    ``lenient`` (retrieval over a whole library) skips a missing or ambiguous
+    entry instead of failing the case; it never substitutes another file.
     """
+    skipped: list[str] = []
     roots = _paper_roots(settings_data_dir)
-    allowed = [settings_data_dir.resolve(), Path("/data").resolve()]
+    data_bases = [settings_data_dir, Path("/data")]
     if os.environ.get("DATA_PATH"):
-        allowed.append(Path(os.environ["DATA_PATH"]).resolve())
+        data_bases.append(Path(os.environ["DATA_PATH"]))
+    allowed = list(dict.fromkeys([_lexical(base) for base in data_bases] + [base.resolve() for base in data_bases]))
 
     def within(path: Path) -> bool:
-        resolved = path.resolve()
-        return any(resolved == base or base in resolved.parents for base in allowed)
+        # A library may be a directory of symlinks into a shared store; the
+        # declared (lexical) location is what must lie inside the data mount.
+        # Parent traversal is rejected separately, so this cannot escape it.
+        return any(candidate == base or base in candidate.parents
+                   for candidate in (_lexical(path), path.resolve()) for base in allowed)
 
     def checked(path: Path) -> Path:
         if not within(path):
             raise MaterialResolutionError(f"material outside allowed data roots: {path.name}")
-        return path.resolve()
+        return _lexical(path)
+
+    folded_index: dict[str, list[Path]] = {}
+
+    def folded_matches(name: str) -> list[Path]:
+        """Case- and Unicode-insensitive filename lookup in the paper roots.
+
+        The spec treats names differing only in letter case as the same paper
+        and says to read the library's actual file name.
+        """
+        if not folded_index:
+            for root in roots:
+                if root.is_dir():
+                    for value in root.rglob("*"):
+                        if value.is_file():
+                            folded_index.setdefault(_fold_name(value.name), []).append(value)
+            folded_index.setdefault("", [])
+        return [checked(value) for value in folded_index.get(_fold_name(name), [])]
+
+    def folded_path_matches(path: Path) -> list[Path]:
+        # A declared directory part is part of the identity: compare the whole
+        # declared suffix (minus a leading "data/"), never just the basename.
+        parts = list(path.parts[1:] if path.parts and path.parts[0] == "data" and len(path.parts) > 1 else path.parts)
+        wanted = [_fold_name(part) for part in parts]
+        return [value for value in folded_matches(path.name)
+                if [_fold_name(part) for part in value.parts[-len(wanted):]] == wanted]
 
     def discover_library(*, descriptions_only: bool = False) -> list[Path]:
         declared: list[Path] = []
@@ -613,6 +680,12 @@ def resolve_materials(
         for root in (libraries if descriptions_only else (libraries or roots)):
             if root.exists():
                 declared.extend(list_pdfs(root))
+        if not declared:
+            # The library may sit under the team directory or use another name.
+            for directory in _library_like_dirs(data_bases):
+                declared.extend(list_pdfs(directory))
+            if declared:
+                logging.getLogger(__name__).warning("material_library_fallback pdfs=%d", len(declared))
         return [checked(path) for path in declared]
 
     def identical_pdf_scopes(directories: list[Path]) -> bool:
@@ -678,9 +751,24 @@ def resolve_materials(
                     found.extend(checked(value) for root in roots if root.exists()
                                  for value in root.rglob("*") if value.name == path.name)
             found = list(dict.fromkeys(found))
+            if not found and path.suffix:
+                found = list(dict.fromkeys(folded_path_matches(path)))
+                if found:
+                    logging.getLogger(__name__).warning("material_name_folded matches=%d", len(found))
+            if not found and allow_descriptions and len(path.parts) == 1 and not path.suffix:
+                # Not a path and nothing by that name exists: it is prose
+                # describing the library, e.g. "论文库中的全部论文".
+                descriptions.append(item)
+                continue
             if not found:
+                if lenient:
+                    skipped.append("not_found")
+                    continue
                 raise MaterialResolutionError(f"declared material not found: {path.name}")
             if len(found) != 1 and not (_identical_materials(found) or identical_pdf_scopes(found)):
+                if lenient:
+                    skipped.append("ambiguous")
+                    continue
                 raise MaterialResolutionError(f"ambiguous declared material: {path.name}")
             value = found[0]
             if value.is_dir():
@@ -713,8 +801,15 @@ def resolve_materials(
         key = path.name.lower()
         if key in names:
             if names[key] != path and not _identical_materials([names[key], path]):
-                raise MaterialResolutionError(f"ambiguous PDF filename: {path.name}")
+                if not lenient:
+                    raise MaterialResolutionError(f"ambiguous PDF filename: {path.name}")
+                # Answers name papers by file name only; keep the first copy.
+                skipped.append("duplicate_name")
             continue
         names[key] = path
         unique.append(path)
+    if skipped:
+        logging.getLogger(__name__).warning("material_resolution_skipped %s", dict(Counter(skipped)))
+        if not unique:
+            raise MaterialResolutionError(f"no declared material could be resolved: {dict(Counter(skipped))}")
     return unique

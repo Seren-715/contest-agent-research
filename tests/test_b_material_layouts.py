@@ -1,0 +1,108 @@
+"""Platform layouts that made B fail before any model call (eval-20261101: 0 calls, ~0.2 s)."""
+from __future__ import annotations
+
+import json
+import unicodedata
+
+import pytest
+
+import core.solve as solve
+from core.paperlib import MaterialResolutionError, resolve_materials
+from tests.conftest import FakeClient
+
+
+def _pdf(path, body=b"%PDF-1.4 test"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return path
+
+
+@pytest.fixture
+def mount(tmp_path, monkeypatch):
+    data = tmp_path / "output" / "data"
+    mount = tmp_path / "readonly"
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    return data, mount
+
+
+def test_filename_differing_only_in_case_resolves_to_the_actual_file(mount):
+    data, root = mount
+    actual = _pdf(root / "论文库" / "Adaptive_Decoding.pdf")
+    assert resolve_materials(["adaptive_decoding.PDF"], data) == [actual]
+
+
+def test_filename_in_another_unicode_normal_form_resolves(mount):
+    data, root = mount
+    actual = _pdf(root / "论文库" / unicodedata.normalize("NFD", "Café.pdf"))
+    assert resolve_materials([unicodedata.normalize("NFC", "Café.pdf")], data) == [actual]
+
+
+def test_prose_scope_without_scope_words_is_a_description_only_when_allowed(mount):
+    data, root = mount
+    paper = _pdf(root / "论文库" / "a.pdf")
+    assert resolve_materials(["论文库中的全部论文"], data, allow_descriptions=True) == [paper]
+    with pytest.raises(MaterialResolutionError, match="not found"):
+        resolve_materials(["论文库中的全部论文"], data)
+
+
+def test_library_of_symlinks_into_a_shared_store_is_readable_under_its_library_name(mount, tmp_path):
+    data, root = mount
+    target = _pdf(tmp_path / "shared-store" / "blob-123.pdf")
+    link = root / "论文库" / "Adaptive_Decoding.pdf"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    resolved = resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True)
+    assert [path.name for path in resolved] == ["Adaptive_Decoding.pdf"]
+    assert resolve_materials(["Adaptive_Decoding.pdf"], data)[0].name == "Adaptive_Decoding.pdf"
+
+
+def test_parent_traversal_is_still_rejected(mount):
+    data, root = mount
+    _pdf(root / "论文库" / "a.pdf")
+    with pytest.raises(MaterialResolutionError, match="parent traversal"):
+        resolve_materials(["论文库/../论文库/a.pdf"], data)
+
+
+@pytest.mark.parametrize("folder", ["t/论文库", "pdfs", "t/Papers_2026"])
+def test_description_discovers_a_library_with_another_name_or_under_the_team(mount, folder):
+    data, root = mount
+    paper = _pdf(root / folder / "a.pdf")
+    _pdf(root / "experiments" / "D-01" / "method.pdf")  # task material, not the library
+    assert resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True) == [paper]
+
+
+def test_lenient_retrieval_skips_missing_and_duplicate_entries_but_strict_mode_fails(mount):
+    data, root = mount
+    a = _pdf(root / "论文库" / "a.pdf")
+    _pdf(root / "论文库" / "x" / "dup.pdf", b"%PDF-1")
+    _pdf(root / "论文库" / "y" / "dup.pdf", b"%PDF-2")
+    assert resolve_materials(["a.pdf", "missing.pdf"], data, lenient=True) == [a]
+    with pytest.raises(MaterialResolutionError, match="not found"):
+        resolve_materials(["a.pdf", "missing.pdf"], data)
+    with pytest.raises(MaterialResolutionError, match="could be resolved"):
+        resolve_materials(["missing.pdf"], data, lenient=True)
+    library = resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True, lenient=True)
+    assert sorted(path.name for path in library) == ["a.pdf", "dup.pdf"]
+    with pytest.raises(MaterialResolutionError, match="ambiguous PDF filename"):
+        resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True)
+
+
+def test_b_case_with_a_case_differing_material_reaches_the_model(settings, monkeypatch, tmp_path):
+    from fpdf import FPDF
+    mount = tmp_path / "readonly"
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    path = mount / "论文库" / "Adaptive_Decoding.pdf"
+    path.parent.mkdir(parents=True)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=10)
+    pdf.multi_cell(0, 5, "Adaptive decoding for language inference throughput.")
+    pdf.output(str(path))
+    reply = json.dumps({"papers": [{"filename": "Adaptive_Decoding.pdf", "reason": "原文研究自适应解码与推理吞吐量。"}]},
+                       ensure_ascii=False)
+    client = FakeClient([reply])
+    monkeypatch.setattr(solve, "model_client", lambda settings: client)
+    result = solve.solve_task({"case_id": "B-01", "function": "Literature_Retrieval",
+                               "input": "adaptive decoding", "materials": ["adaptive_decoding.pdf"]}, settings)
+    assert len(client.calls) == 1
+    assert [item["filename"] for item in result["papers"]] == ["Adaptive_Decoding.pdf"]
