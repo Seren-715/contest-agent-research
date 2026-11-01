@@ -296,3 +296,70 @@ def test_plain_topic_words_do_not_count_as_conditions():
     from handlers.b_retrieval import CONSTRAINT_RE
     for query in ("非线性系统的自适应控制", "检索增强生成方法", "adaptive decoding for language inference"):
         assert not CONSTRAINT_RE.search(query), query
+
+
+class ScreenThenVerify:
+    """Screen keeps paper_x7 files; verify accepts everything it is shown."""
+
+    def __init__(self, fail_screen_batches=()):
+        self.screen_calls = []
+        self.verify_calls = []
+        self.fail_screen_batches = set(fail_screen_batches)
+
+    def complete(self, messages, **kwargs):
+        prompt = messages[-1]["content"]
+        if "宽松初筛" in prompt:
+            names = re.findall(r"^\d+\. (paper_\d+\.pdf)$", prompt, re.MULTILINE)
+            self.screen_calls.append(names)
+            if len(self.screen_calls) - 1 in self.fail_screen_batches:
+                raise RuntimeError("upstream unavailable")
+            return json.dumps({"papers": [{"filename": n} for n in names if n.endswith("7.pdf")]})
+        names = re.findall(r"\d+\. (paper_\d+\.pdf)（", prompt)
+        self.verify_calls.append(names)
+        return json.dumps({"papers": [{"filename": n, "reason": "正文研究自适应解码与语言推理吞吐量。"} for n in names]},
+                          ensure_ascii=False)
+
+
+def _large_corpus(monkeypatch, tmp_path, count=130):
+    paths = [tmp_path / ("paper_%03d.pdf" % index) for index in range(count)]
+    for path in paths:
+        path.write_bytes(b"%PDF-")
+    body = "Adaptive decoding for language inference throughput"
+    records = [MaterialRecord(path=p, filename=p.name, sha256="t", bytes=6, pages=1,
+                              title="Language inference", abstract=body, text=body) for p in paths]
+    monkeypatch.setattr("handlers.b_retrieval.resolve_materials", lambda *a, **kw: paths)
+    monkeypatch.setattr("handlers.b_retrieval.index_materials", lambda actual, **kwargs: records)
+    return paths
+
+
+def test_large_library_is_screened_once_per_paper_then_verified(settings, tmp_path, monkeypatch):
+    paths = _large_corpus(monkeypatch, tmp_path)
+    client = ScreenThenVerify()
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
+                                       settings, client)
+    screened = [name for call in client.screen_calls for name in call]
+    assert sorted(screened) == sorted(p.name for p in paths)  # every paper seen exactly once
+    assert len(client.screen_calls) == 2
+    expected = {p.name for p in paths if p.name.endswith("7.pdf")}
+    assert {name for call in client.verify_calls for name in call} == expected
+    assert len(client.verify_calls) == 1
+    assert {item["filename"] for item in result["papers"]} == expected
+    validate_answer("Literature_Retrieval", result)
+
+
+def test_failed_screen_batch_passes_its_papers_to_verification(settings, tmp_path, monkeypatch):
+    _large_corpus(monkeypatch, tmp_path)
+    client = ScreenThenVerify(fail_screen_batches={0})
+    RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
+    verified = {name for call in client.verify_calls for name in call}
+    assert set(client.screen_calls[0]) <= verified
+    assert {n for n in client.screen_calls[1] if n.endswith("7.pdf")} <= verified
+    assert not {n for n in client.screen_calls[1] if not n.endswith("7.pdf")} & verified
+
+
+def test_small_library_skips_the_screen(settings, tmp_path, monkeypatch):
+    _large_corpus(monkeypatch, tmp_path, count=30)
+    client = ScreenThenVerify()
+    RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
+    assert client.screen_calls == []
+    assert sum(len(call) for call in client.verify_calls) == 30
