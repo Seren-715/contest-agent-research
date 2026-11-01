@@ -869,6 +869,9 @@ def resolve_materials(
         candidates = []
         descriptions: list[str] = []
         explicit_paper_scope = False
+        # A declared entry skipped in lenient mode was still a declaration:
+        # it must not leave an accompanying description free to widen.
+        explicit_skipped = False
         for item in values:
             check_active()
             path = Path(item)
@@ -917,11 +920,13 @@ def resolve_materials(
             if not found:
                 if lenient:
                     skipped.append("not_found")
+                    explicit_skipped = True
                     continue
                 raise MaterialResolutionError(f"declared material not found: {path.name}")
             if len(found) != 1 and not (_identical_materials(found) or identical_pdf_scopes(found)):
                 if lenient:
                     skipped.append("ambiguous")
+                    explicit_skipped = True
                     continue
                 raise MaterialResolutionError(f"ambiguous declared material: {path.name}")
             value = found[0]
@@ -938,7 +943,11 @@ def resolve_materials(
             else:
                 raise MaterialResolutionError(f"declared material is not a regular file or directory: {path.name}")
         if descriptions:
-            if not explicit_paper_scope:
+            if explicit_skipped and not explicit_paper_scope:
+                logging.getLogger(__name__).warning(
+                    "material_description_scope descriptions=%d explicit_skipped=true no_scope_expansion=true",
+                    len(descriptions))
+            elif not explicit_paper_scope:
                 candidates = discover_library(descriptions_only=True)
                 logging.getLogger(__name__).warning(
                     "material_description_scope descriptions=%d candidates=%d requires_selection=true",

@@ -258,3 +258,23 @@ def test_another_teams_workspace_is_never_searched(mount, monkeypatch, team):
         with pytest.raises(MaterialResolutionError, match="not found"):
             resolve_materials(declared, data)
     assert resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True) == []
+
+
+@pytest.mark.parametrize("description", ["本地论文库中的全部论文", "论文库中的全部论文"])
+def test_missing_explicit_pdf_next_to_a_description_never_widens_to_the_library(mount, description):
+    # A declared paper that cannot be found does not turn the accompanying
+    # description into permission to search the whole library.
+    data, root = mount
+    _pdf(root / "论文库" / "a.pdf")
+    _pdf(root / "论文库" / "b.pdf")
+    for kwargs in ({"prose_scope": True}, {}):
+        with pytest.raises(MaterialResolutionError, match="could be resolved"):
+            resolve_materials(["missing.pdf", description], data, allow_descriptions=True, lenient=True, **kwargs)
+    # Ambiguous explicit entries count the same way.
+    _pdf(root / "论文库" / "x" / "dup.pdf", b"%PDF-1")
+    _pdf(root / "论文库" / "y" / "dup.pdf", b"%PDF-2")
+    with pytest.raises(MaterialResolutionError, match="could be resolved"):
+        resolve_materials(["dup.pdf", description], data, allow_descriptions=True, lenient=True, prose_scope=True)
+    # A found explicit paper still bounds the scope to itself.
+    assert resolve_materials(["a.pdf", "missing.pdf", description], data, allow_descriptions=True,
+                             lenient=True, prose_scope=True) == [root / "论文库" / "a.pdf"]

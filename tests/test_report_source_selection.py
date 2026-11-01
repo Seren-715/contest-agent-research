@@ -267,7 +267,7 @@ def test_second_idea_repair_uses_the_kept_draft_not_the_rejected_revision(paper_
     assert payload["markdown"].strip() == good.strip()
 
 
-def test_possible_papers_fill_up_to_two_beyond_the_count_and_core_is_never_cut(settings, tmp_path, monkeypatch):
+def test_core_papers_come_first_and_no_labelled_paper_is_ever_cut(settings, tmp_path, monkeypatch):
     records = _library(tmp_path, monkeypatch, designated=8)
     z = [r.path for r in records if r.filename.startswith("z")]
 
@@ -279,19 +279,22 @@ def test_possible_papers_fill_up_to_two_beyond_the_count_and_core_is_never_cut(s
 
     question = {"case_id": "C-01", "input": "撰写电池回收综述，至少 5 篇指定论文",
                 "materials": ["本地论文文件夹内指定的电池回收 PDF"]}
-    client = FakeClient([labelled(z[:3], z[3:8])])
+    # The model lists a possible paper before a core one: core comes first,
+    # and every labelled paper is kept whatever count the task seems to state.
+    client = FakeClient([labelled(z[1:3], [z[0]] + z[3:8])])
     paths = select_report_materials(question, settings, client, Deadline(900))
-    assert paths == z[:7]  # 3 core + possibles up to 5 + 2
+    assert paths == z[1:3] + [z[0]] + z[3:8]
     assert '"possible"' in client.calls[0][-1]["content"] and "漏掉一篇指定论文" in client.calls[0][-1]["content"]
     # Core papers beyond the count are all kept; no possible is added then.
     paths = select_report_materials(question, settings, FakeClient([labelled(z[:8], [])]), Deadline(900))
     assert paths == z[:8]
     paths = select_report_materials(question, settings, FakeClient([labelled(z[:7], z[7:8])]), Deadline(900))
-    assert paths == z[:7]
+    assert paths == z[:8]
 
 
 @pytest.mark.parametrize("task,count", [("撰写电池回收综述，至少引用十项相关研究", 10), ("撰写电池回收综述", 9),
-                                        ("撰写综述，需覆盖十余项工作", 11)])
+                                        ("撰写综述，需覆盖十余项工作", 11),
+                                        ("至少引用 5 篇论文，并覆盖十余项相关研究", 11)])
 def test_possible_papers_are_never_cut_below_a_count_the_task_may_require(settings, tmp_path, monkeypatch, task, count):
     records = _library(tmp_path, monkeypatch, designated=count)
     z = [r.path for r in records if r.filename.startswith("z")]

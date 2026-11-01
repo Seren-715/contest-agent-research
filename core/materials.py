@@ -170,18 +170,13 @@ def select_report_materials(
                 confidence = "possible" if str(hit.get("confidence", "")).strip().lower() == "possible" else "core"
                 selected.setdefault(name, {"filename": name, "reason": reason.strip(), "sha256": by_name[name].sha256,
                                            "confidence": confidence})
-    # Core papers are never cut: a parsed count can be incomplete ("at least
-    # 5 ... and at least 10 ..."). Uncertain same-topic papers are cut only
-    # against a count the task states, and only beyond count + 2: a missed
-    # designated paper loses citation credit while an extra one does not
-    # (scoring rules, 引文溯源类). An unparsed count ("十余项") cuts nothing.
-    core_names = [name for name, item in selected.items() if item["confidence"] == "core"]
-    possible = [name for name, item in selected.items() if item["confidence"] == "possible"]
-    kept = core_names + (possible if stated is None else possible[:max(0, stated + 2 - len(core_names))])
-    dropped = [name for name in possible if name not in kept]
-    if dropped:
-        logging.getLogger(__name__).warning("report_selection_possible_dropped case_id=%s count=%d", case_id, len(dropped))
-    selected = {name: selected[name] for name in selected if name in kept}
+    # Nothing is cut: a parsed count can be incomplete ("至少 5 篇……十余项"),
+    # and a missed designated paper loses citation credit while an extra one
+    # does not (scoring rules, 引文溯源类). The label only orders the list:
+    # core papers first, each group in the model's order.
+    order = ([name for name, item in selected.items() if item["confidence"] == "core"]
+             + [name for name, item in selected.items() if item["confidence"] == "possible"])
+    selected = {name: selected[name] for name in order}
     if not selected:
         raise HandlerError("no source matched the described report scope")
     # This is a selection receipt, not a claim that model relevance is gold.
