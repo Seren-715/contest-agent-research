@@ -58,12 +58,18 @@ class RetrievalLimits:
     batches: int = 8
     results: int = 80
     excerpt_chars: int = 1400
+    # Two-stage retrieval for larger libraries (the contest uses ~100+ PDFs):
+    # a lenient short-excerpt screen of every paper, then the detailed rerank.
+    screen_threshold: int = 40
+    screen_batch: int = 70
+    screen_chars: int = 500
 
     @classmethod
     def from_env(cls) -> "RetrievalLimits":
         defaults = cls()
         values = {}
-        for field in ("candidates", "batch_size", "batches", "results", "excerpt_chars"):
+        for field in ("candidates", "batch_size", "batches", "results", "excerpt_chars",
+                      "screen_threshold", "screen_batch", "screen_chars"):
             value = int(os.environ.get("CONTEST_B_" + field.upper(), getattr(defaults, field)))
             if value <= 0:
                 raise ValueError("CONTEST_B_" + field.upper() + " must be positive")
@@ -174,6 +180,70 @@ def _rank_records(query: str, records: list[MaterialRecord],
     )
 
 
+SCREEN_SYSTEM = (
+    "你是文献检索初筛助手。只能使用列表中的完整文件名，不能编造。只输出一个 JSON 对象，不要加代码围栏。"
+)
+
+
+def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[MaterialRecord, float]],
+            search_text: str, limits: RetrievalLimits, deadline: Deadline, settings: Settings,
+            case_id: str) -> set[str] | None:
+    """Lenient first pass over every paper with short excerpts.
+
+    Sequential detailed batches over 100+ papers do not fit the B time budget,
+    so lexical rank would decide which papers the model never sees. Here every
+    paper is seen once. Papers of a failed screen batch pass through to the
+    detailed stage. Returns None only if every screen batch failed.
+    """
+    kept: set[str] = set()
+    succeeded = 0
+    for offset in range(0, len(ranked), limits.screen_batch):
+        check_active()
+        batch = ranked[offset:offset + limits.screen_batch]
+        names = {record.filename.casefold() for record, _ in batch}
+        if deadline.remaining() < 60:
+            LOGGER.warning("B screen stopped at deadline after %d papers", offset)
+            break
+        listing = "\n".join(
+            f"{index}. {record.filename}\n" + " ".join(evidence_excerpt(
+                record, query=search_text, max_chars=limits.screen_chars).split())
+            for index, (record, _) in enumerate(batch, start=1)
+        )
+        prompt = (
+            f"检索需求：{query}\n\n额外约束：\n{extra or '（无）'}\n\n"
+            "候选论文（标题与少量原文摘录）：\n" + listing + "\n\n"
+            "这是宽松初筛，后面还有带完整证据的复核。凡核心主题、方法、任务或数据可能与检索需求相关的论文都保留；"
+            "只排除明显无关的论文，以及摘录已明确显示违反硬约束的论文。拿不准时保留。\n"
+            "只输出 JSON：{\"papers\":[{\"filename\":\"...\"}]}，filename 必须逐字一致。"
+        )
+        try:
+            record_stage(settings, case_id, "model_screen", candidate_count=len(batch))
+            text = client.complete(
+                [{"role": "system", "content": SCREEN_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=output_budget(),
+                timeout=deadline.timeout(settings.request_timeout, label="retrieval screen"),
+            )
+            raw = extract_json_object(text).get("papers")
+            if not isinstance(raw, list):
+                raise HandlerError("papers is not a list")
+        except Exception as exc:
+            check_active()
+            record_stage(settings, case_id, "model_screen_failed", error_type=type(exc).__name__)
+            LOGGER.warning("B screen batch failed (%s); passing its %d papers through", type(exc).__name__, len(batch))
+            kept |= names
+            continue
+        succeeded += 1
+        for item in raw:
+            key = str(item.get("filename", "")).strip().casefold() if isinstance(item, dict) else str(item).strip().casefold()
+            if key in names:
+                kept.add(key)
+    if not succeeded:
+        return None
+    record_stage(settings, case_id, "screened", total=len(ranked), kept=len(kept))
+    return kept
+
+
 class RetrievalHandler:
     def handle(self, question: dict[str, Any], settings: Settings, client: ModelClient) -> dict[str, Any]:
         case_id = question["case_id"]
@@ -217,10 +287,19 @@ class RetrievalHandler:
         record_stage(settings, case_id, "query_expanded", cjk=_has_cjk(query), keyword_count=len(keywords))
         ranked = _rank_records(query, records, tuple(keywords))
         capacity = min(limits.candidates, limits.batch_size * limits.batches)
-        candidates = ranked[:capacity]
-        if len(ranked) > capacity:
-            LOGGER.warning("B candidate budget: evaluating %d of %d papers", capacity, len(ranked))
         extra = constraints_text(question)
+        pool = ranked
+        if len(ranked) > limits.screen_threshold:
+            kept = _screen(client, query, extra, ranked, search_text, limits, deadline, settings, case_id)
+            if kept is not None:
+                # Keep lexical order among survivors: it decides who goes first
+                # if time runs short in the detailed stage.
+                pool = [(record, value) for record, value in ranked if record.filename.casefold() in kept]
+                if not pool:
+                    return {"case_id": case_id, "papers": []}
+        candidates = pool[:capacity]
+        if len(pool) > capacity:
+            LOGGER.warning("B candidate budget: evaluating %d of %d papers", capacity, len(pool))
         prompt_prefix = (
             f"检索需求：{query}\n\n"
             f"额外约束：\n{extra or '（无）'}\n\n"
