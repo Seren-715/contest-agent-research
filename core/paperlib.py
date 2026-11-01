@@ -590,6 +590,14 @@ def _lexical(path: Path) -> Path:
     return Path(os.path.abspath(str(path)))
 
 
+def _looks_like_prose_scope(text: str) -> bool:
+    """A sentence about papers (CJK or spaced words), not a bare identifier."""
+    value = text.strip()
+    mentions_papers = re.search(r"论文|文献|pdf|papers?\b|literature", value, re.IGNORECASE)
+    sentence_like = re.search(r"[\u4e00-\u9fff]", value) or re.search(r"\s", value)
+    return bool(mentions_papers and sentence_like)
+
+
 def _on_disk_case(path: Path) -> Path:
     """On case-insensitive file systems a path "exists" in any letter case;
     report the file name exactly as the directory stores it."""
@@ -666,6 +674,16 @@ def resolve_materials(
             raise MaterialResolutionError(f"material outside allowed data roots: {path.name}")
         # Keep the library's own (link) name, spelled as it is on disk.
         return _on_disk_case(_lexical(path))
+
+    def accept(paths: Iterable[Path]) -> list[Path]:
+        """checked() for each path; whole-library retrieval skips escaping links."""
+        result: list[Path] = []
+        for value in paths:
+            if lenient and not within(value):
+                skipped.append("outside_roots")
+                continue
+            result.append(checked(value))
+        return result
 
     folded_index: dict[str, list[Path]] = {}
 
@@ -755,7 +773,7 @@ def resolve_materials(
             if ".." in path.parts:
                 raise MaterialResolutionError("material path contains parent traversal")
             if path.is_absolute():
-                found = [checked(path)] if path.exists() else []
+                found = accept([path]) if path.exists() else []
             else:
                 exact = [base / path for base in [settings_data_dir, settings_data_dir.parent] + roots]
                 # Questions use paths relative to the contest package, while
@@ -771,18 +789,20 @@ def resolve_materials(
                     if suffix.parts[0] in ("论文库", "papers") and len(suffix.parts) > 1:
                         exact.extend(root / Path(*suffix.parts[1:]) for root in roots
                                      if root.name == suffix.parts[0])
-                found = [checked(value) for value in exact if value.exists()]
+                found = accept(value for value in exact if value.exists())
                 if len(path.parts) == 1:
-                    found.extend(checked(value) for root in roots if root.exists()
-                                 for value in root.rglob("*") if value.name == path.name)
+                    found.extend(accept(value for root in roots if root.exists()
+                                        for value in root.rglob("*") if value.name == path.name))
             found = list(dict.fromkeys(found))
             if not found and path.suffix:
                 found = list(dict.fromkeys(folded_path_matches(path)))
                 if found:
                     logging.getLogger(__name__).warning("material_name_folded matches=%d", len(found))
-            if not found and allow_descriptions and len(path.parts) == 1 and not path.suffix:
-                # Not a path and nothing by that name exists: it is prose
-                # describing the library, e.g. "论文库中的全部论文".
+            if (not found and allow_descriptions and len(path.parts) == 1 and not path.suffix
+                    and _looks_like_prose_scope(item)):
+                # Not a path and nothing by that name exists, and it reads as a
+                # sentence about papers, e.g. "论文库中的全部论文". A missing
+                # identifier such as "important_folder" stays an error.
                 descriptions.append(item)
                 continue
             if not found:
@@ -798,7 +818,7 @@ def resolve_materials(
             value = found[0]
             if value.is_dir():
                 explicit_paper_scope = True
-                candidates.extend(checked(pdf) for pdf in list_pdfs(value))
+                candidates.extend(accept(list_pdfs(value)))
             elif value.is_file() and value.suffix.lower() == ".pdf":
                 explicit_paper_scope = True
                 candidates.append(value)

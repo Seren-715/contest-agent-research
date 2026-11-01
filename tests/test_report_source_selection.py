@@ -188,9 +188,46 @@ def test_selection_keeps_at_most_two_more_than_the_designated_count(settings, tm
     assert paths == picked[:7]
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("列出至少 5 篇实际引用的指定论文", 5), ("至少6篇", 6), ("比较 4 篇指定论文", 4), ("撰写综述", 5),
+@pytest.mark.parametrize("question,expected", [
+    ({"input": "列出至少 5 篇实际引用的指定论文"}, 5),
+    ({"input": "至少6篇"}, 6),
+    ({"input": "比较 4 篇指定论文"}, 4),
+    ({"input": "撰写综述"}, None),
+    ({"input": "撰写综述", "constraints": ["参考文献至少十篇"]}, 10),
+    ({"input": "比较十二篇指定论文"}, 12),
+    ({"input": "至少两篇"}, 2),
+    ({"input": "至少 5 篇", "constraints": ["至少引用十篇指定论文"]}, 10),
+    ({"input": "Cite at least 8 papers"}, 8),
 ])
-def test_required_count_is_read_from_the_task(text, expected):
+def test_required_count_is_read_from_the_task(question, expected):
     from core.materials import _required_count
-    assert _required_count({"input": text}) == expected
+    assert _required_count(question) == expected
+
+
+def test_stated_requirement_of_ten_keeps_all_ten_selected_papers(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch, designated=10)
+    picked = [r.path for r in records if r.filename.startswith("z")]
+
+    class Picker:
+        prompts = []
+
+        def complete(self, messages, **kwargs):
+            self.prompts.append(messages[-1]["content"])
+            return choice(picked)
+
+    client = Picker()
+    paths = select_report_materials({"case_id": "C-01", "input": "撰写电池回收综述",
+                                     "constraints": ["参考文献至少十篇指定论文"],
+                                     "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                    settings, client, Deadline(900))
+    assert paths == picked
+    assert "通常指定 10 篇" in client.prompts[0]
+
+
+def test_unstated_requirement_never_trims_the_model_selection(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch, designated=9)
+    picked = [r.path for r in records if r.filename.startswith("z")]
+    paths = select_report_materials({"case_id": "C-01", "input": "撰写电池回收综述",
+                                     "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                    settings, FakeClient([choice(picked)]), Deadline(900))
+    assert paths == picked

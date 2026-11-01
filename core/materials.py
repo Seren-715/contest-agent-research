@@ -29,14 +29,40 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
-def _required_count(question: dict[str, Any]) -> int:
-    """Papers the task designates: "至少 N 篇" / "N 篇指定论文"; the rules use five."""
-    text = " ".join(str(question.get(key) or "") for key in ("title", "input", "expected_output"))
-    for pattern in (r"至少\s*(\d+)\s*篇", r"(\d+)\s*篇(?:指定)?(?:论文|文献)", r"at\s+least\s+(\d+)\s+papers?"):
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match and 1 <= int(match.group(1)) <= 20:
-            return int(match.group(1))
-    return 5
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_number(text: str) -> int | None:
+    """Chinese numerals 1-99: 五, 十, 十二, 二十, 两."""
+    if text.isdigit():
+        return int(text)
+    if "十" not in text:
+        return _CN_DIGITS.get(text) if len(text) == 1 else None
+    tens, _, ones = text.partition("十")
+    if (tens and tens not in _CN_DIGITS) or (ones and ones not in _CN_DIGITS):
+        return None
+    return (_CN_DIGITS[tens] if tens else 1) * 10 + (_CN_DIGITS[ones] if ones else 0)
+
+
+def _required_count(question: dict[str, Any]) -> int | None:
+    """Papers the task explicitly requires ("至少十篇", "5 篇指定论文"), else None.
+
+    Reads title, input, constraints and expected_output. The largest stated
+    count wins so that a requirement is never under-counted.
+    """
+    fields = [question.get(key) for key in ("title", "input", "expected_output")]
+    constraints = question.get("constraints")
+    fields.extend(constraints if isinstance(constraints, list) else [constraints])
+    text = " ".join(str(value) for value in fields if value)
+    number = r"(\d+|[零一二两三四五六七八九十]{1,3})"
+    counts = []
+    for pattern in (r"至少\s*" + number + r"\s*篇", number + r"\s*篇\s*(?:指定|实际引用的|相关)?\s*(?:论文|文献|材料|PDF)",
+                    r"at\s+least\s+(\d+)\s+(?:papers?|sources?)", r"(\d+)\s+(?:designated|specified)\s+papers?"):
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            value = _cn_number(match.group(1))
+            if value is not None and 1 <= value <= 50:
+                counts.append(value)
+    return max(counts) if counts else None
 
 
 def _display_name(path: Path) -> str:
@@ -72,7 +98,8 @@ def select_report_materials(
         raise HandlerError("described paper library has no extractable evidence")
     query = question_text(question)
     title = str(question.get("title") or "").strip()
-    required = _required_count(question)
+    stated = _required_count(question)
+    required = stated or 5  # the rules score five designated materials
     papers = [Paper(item.path, _display_name(item.path), item.text) for item in records]
     # BM25 only orders the list; it never removes a paper. A Chinese task over
     # English papers scores ~0 everywhere, so a cut-off would be alphabetical.
@@ -131,8 +158,10 @@ def select_report_materials(
             name, reason = hit.get("filename"), hit.get("reason")
             if isinstance(name, str) and name in allowed and isinstance(reason, str) and len(reason.strip()) >= 8:
                 selected.setdefault(name, {"filename": name, "reason": reason.strip(), "sha256": by_name[name].sha256})
-    limit = required + 2
-    if len(selected) > limit:
+    # Trim only against an explicitly stated count; an unparsed requirement
+    # must never cut papers the model selected.
+    limit = stated + 2 if stated else None
+    if limit is not None and len(selected) > limit:
         logging.getLogger(__name__).warning("report_selection_trimmed case_id=%s selected=%d kept=%d",
                                             case_id, len(selected), limit)
         selected = dict(list(selected.items())[:limit])

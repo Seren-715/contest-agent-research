@@ -135,3 +135,34 @@ def test_on_disk_case_reports_the_stored_name(tmp_path):
     assert _on_disk_case(tmp_path / "adaptive_decoding.PDF") == stored
     assert _on_disk_case(tmp_path / "Adaptive_Decoding.pdf") == stored
     assert _on_disk_case(tmp_path / "missing.pdf") == tmp_path / "missing.pdf"
+
+
+def test_missing_identifier_is_not_reinterpreted_as_a_library_description(mount):
+    data, root = mount
+    _pdf(root / "论文库" / "a.pdf")
+    for kwargs in ({}, {"allow_descriptions": True}):
+        with pytest.raises(MaterialResolutionError, match="not found"):
+            resolve_materials(["important_folder"], data, **kwargs)
+    with pytest.raises(MaterialResolutionError, match="could be resolved"):
+        resolve_materials(["important_folder"], data, allow_descriptions=True, lenient=True)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("论文库中的全部论文", True), ("all local papers", True), ("important_folder", False),
+    ("papers_2024", False), ("目录", False),
+])
+def test_prose_scope_detection(text, expected):
+    from core.paperlib import _looks_like_prose_scope
+    assert _looks_like_prose_scope(text) is expected
+
+
+def test_lenient_explicit_materials_skip_an_escaping_link_and_keep_the_rest(mount, tmp_path):
+    data, root = mount
+    good = _pdf(root / "论文库" / "good.pdf")
+    _symlink(root / "论文库" / "escape.pdf", _pdf(tmp_path / "outside-store" / "secret.pdf"))
+    assert resolve_materials(["good.pdf", "escape.pdf"], data, lenient=True) == [good]
+    assert resolve_materials(["论文库"], data, lenient=True) == [good]  # explicit directory
+    with pytest.raises(MaterialResolutionError, match="outside allowed data roots"):
+        resolve_materials(["good.pdf", "escape.pdf"], data)
+    with pytest.raises(MaterialResolutionError, match="outside allowed data roots"):
+        resolve_materials(["论文库"], data)
