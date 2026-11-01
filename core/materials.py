@@ -18,7 +18,7 @@ from core.execution import check_active
 from core.io import write_json
 from core.llm import ModelClient, ModelError, output_budget
 from core.paperlib import (Paper, bm25_rank, describe_material_scope, evidence_excerpt,
-                           index_materials, is_material_description, resolve_materials)
+                           index_materials, material_exists, resolve_materials)
 from handlers.base import HandlerError, constraints_text, extract_json_object, question_text
 
 
@@ -78,14 +78,17 @@ def select_report_materials(
     if not isinstance(case_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", case_id):
         raise HandlerError("invalid report case identity")
     declarations = question.get("materials")
-    descriptions = describe_material_scope(declarations)
+    # An existing file or directory is never a description, even when its
+    # name reads like one (e.g. a folder "指定论文").
+    descriptions = [value for value in describe_material_scope(declarations)
+                    if not material_exists(value, settings.data_dir)]
     paths = resolve_materials(declarations, settings.data_dir, allow_descriptions=bool(descriptions))
     if not descriptions:
         return paths
     values = [declarations] if isinstance(declarations, str) else declarations or []
     # An explicit PDF/directory list remains authoritative even if accompanied
     # by a prose explanation. Auxiliary-only declarations do not specify PDFs.
-    explicit = [value for value in values if not is_material_description(value)]
+    explicit = [value for value in values if not (isinstance(value, str) and value.strip() in descriptions)]
     if explicit and resolve_materials(explicit, settings.data_dir):
         return paths
     if not paths:

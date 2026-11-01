@@ -558,6 +558,20 @@ def describe_material_scope(materials: object) -> list[str]:
     return [value.strip() for value in values if is_material_description(value)]
 
 
+def material_exists(value: object, settings_data_dir: Path) -> bool:
+    """Whether a declaration names an existing file or directory.
+
+    Existing paths take precedence over description wording: a folder called
+    "指定论文" is a path. Uses the same lookup as resolve_materials().
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        return bool(resolve_materials([value], settings_data_dir))
+    except MaterialResolutionError:
+        return False
+
+
 def has_explicit_material_scope(materials: object) -> bool:
     """Recognize ordinary PDF/directory declarations, after strict resolution.
 
@@ -756,11 +770,6 @@ def resolve_materials(
         explicit_paper_scope = False
         for item in values:
             check_active()
-            if is_material_description(item):
-                if not allow_descriptions:
-                    raise MaterialResolutionError("descriptive material scope requires explicit selection")
-                descriptions.append(item)
-                continue
             path = Path(item)
             if ".." in path.parts:
                 raise MaterialResolutionError("material path contains parent traversal")
@@ -790,9 +799,16 @@ def resolve_materials(
                 found = list(dict.fromkeys(folded_path_matches(path)))
                 if found:
                     logging.getLogger(__name__).warning("material_name_folded matches=%d", len(found))
-            # A missing entry is never reinterpreted as a library description:
-            # keywords cannot tell "2024论文资料" (a folder) from prose, and
-            # guessing would widen the scope to the whole library.
+            # An existing file or directory always wins: a folder named
+            # "指定论文" is a path, not prose. Only an entry that matches
+            # nothing on disk may be a description, and only if it carries the
+            # explicit scope wording is_material_description() requires; any
+            # other missing entry stays not-found and never widens the scope.
+            if not found and is_material_description(item):
+                if not allow_descriptions:
+                    raise MaterialResolutionError("descriptive material scope requires explicit selection")
+                descriptions.append(item)
+                continue
             if not found:
                 if lenient:
                     skipped.append("not_found")

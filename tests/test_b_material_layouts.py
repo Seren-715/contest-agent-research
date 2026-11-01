@@ -153,3 +153,23 @@ def test_lenient_explicit_materials_skip_an_escaping_link_and_keep_the_rest(moun
         resolve_materials(["good.pdf", "escape.pdf"], data)
     with pytest.raises(MaterialResolutionError, match="outside allowed data roots"):
         resolve_materials(["论文库"], data)
+
+
+def test_existing_folder_with_description_like_name_is_a_path_not_the_whole_library(mount):
+    data, root = mount
+    designated = _pdf(root / "论文库" / "指定论文" / "a.pdf")
+    _pdf(root / "论文库" / "其他" / "b.pdf")
+    for kwargs in ({}, {"allow_descriptions": True}, {"allow_descriptions": True, "allow_library": True, "lenient": True}):
+        assert resolve_materials(["指定论文"], data, **kwargs) == [designated]
+
+
+def test_report_selection_uses_an_existing_description_like_folder_directly(mount, settings):
+    from core.budget import Deadline
+    from core.materials import select_report_materials
+    data, root = mount
+    settings = settings.__class__(**{**settings.__dict__, "data_dir": data})
+    designated = [_pdf(root / "论文库" / "指定论文" / f"{n}.pdf") for n in ("a", "c")]
+    _pdf(root / "论文库" / "其他" / "b.pdf")
+    client = FakeClient([])
+    paths = select_report_materials({"case_id": "C-01", "materials": ["指定论文"]}, settings, client, Deadline(300))
+    assert paths == designated and not client.calls  # no model selection, no other folder
