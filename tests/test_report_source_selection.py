@@ -121,6 +121,7 @@ def test_later_selection_batch_failure_keeps_prior_evidence(settings, tmp_path, 
                for i in range(50)]
     monkeypatch.setattr("core.materials.resolve_materials", lambda *args, **kwargs: [r.path for r in records])
     monkeypatch.setattr("core.materials.index_materials", lambda *args, **kwargs: records)
+    monkeypatch.setenv("CONTEST_SELECT_BATCH", "40")
     class TwoBatches:
         calls = 0
         def complete(self, *args, **kwargs):
@@ -135,3 +136,61 @@ def test_later_selection_batch_failure_keeps_prior_evidence(settings, tmp_path, 
     receipt = json.loads((settings.team_dir / "work/materials/C-01.json").read_text(encoding="utf-8"))
     assert receipt["processed_candidates"] == 40
     assert receipt["candidate_coverage_complete"] is False
+
+
+def _library(tmp_path, monkeypatch, designated=5, others=100):
+    from core.paperlib import MaterialRecord
+    records = []
+    for i in range(others):
+        path = tmp_path / "论文库" / "misc" / f"a{i:03d}.pdf"
+        records.append(MaterialRecord(path, path.name, "a" * 64, 100, 1, "Botany", "Forest",
+                                      "Botany observations of tropical forests."))
+    for i in range(designated):
+        path = tmp_path / "论文库" / "battery_recycling" / f"z{i}.pdf"
+        records.append(MaterialRecord(path, path.name, "b" * 64, 100, 1, "Battery recycling", "Hydrometallurgy",
+                                      "Hydrometallurgical recycling of lithium-ion batteries."))
+    monkeypatch.setattr("core.materials.resolve_materials", lambda *args, **kwargs: [r.path for r in records])
+    monkeypatch.setattr("core.materials.index_materials", lambda *args, **kwargs: records)
+    return records
+
+
+def test_selection_shows_every_paper_with_its_folder_and_the_task_title(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch)
+    designated = [r for r in records if r.filename.startswith("z")]
+
+    class Picker:
+        prompts = []
+
+        def complete(self, messages, **kwargs):
+            self.prompts.append(messages[-1]["content"])
+            return choice([r.path for r in designated])
+
+    client = Picker()
+    paths = select_report_materials(
+        {"case_id": "C-01", "title": "电动汽车电池回收：回收工艺与生命周期评估综述",
+         "input": "阅读本题指定论文，撰写综述，列出至少 5 篇实际引用的指定论文。",
+         "materials": ["本地论文文件夹内指定的电池回收 PDF"]}, settings, client, Deadline(900))
+    assert paths == [r.path for r in designated]
+    prompt = client.prompts[0]
+    assert len(client.prompts) == 1
+    # Chinese task, English papers: no BM25 cut-off may drop the designated, alphabetically last papers.
+    assert all(r.filename in prompt for r in records)
+    assert "battery_recycling/z0.pdf" in prompt
+    assert "电动汽车电池回收" in prompt and "通常指定 5 篇" in prompt
+
+
+def test_selection_keeps_at_most_two_more_than_the_designated_count(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch, designated=10)
+    picked = [r.path for r in records if r.filename.startswith("z")]
+    paths = select_report_materials({"case_id": "C-01", "input": "综述，至少 5 篇指定论文",
+                                     "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                    settings, FakeClient([choice(picked)]), Deadline(900))
+    assert paths == picked[:7]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("列出至少 5 篇实际引用的指定论文", 5), ("至少6篇", 6), ("比较 4 篇指定论文", 4), ("撰写综述", 5),
+])
+def test_required_count_is_read_from_the_task(text, expected):
+    from core.materials import _required_count
+    assert _required_count({"input": text}) == expected
