@@ -553,38 +553,65 @@ def material_shape(value: object) -> str:
     return "cjk_name" if re.search(r"[\u4e00-\u9fff]", text) else "ascii_name"
 
 
-def _suffix_matches(path: Path, bases: list[Path], depth: int = 3) -> list[Path]:
-    """The declared relative path below a deeper directory of a data root.
+def _team_name() -> Optional[str]:
+    """This team's directory name, from the same variables as core.config."""
+    for key in ("RESEARCH_WORKSPACE_TEAM", "TEAM_ID", "CONTEST_TEAM"):
+        value = os.environ.get(key, "").strip()
+        if value and value not in (".", "..") and "/" not in value and "\\" not in value:
+            return value
+    return None
 
-    "data/论文库" may live at /data/<team>/论文库. Only the complete declared
-    suffix is matched; task/output trees are skipped. Callers still require a
-    unique (or identical) match.
+
+def _is_team_dir(directory: Path) -> bool:
+    """Any team's workspace (it holds assigned/ or dispatch.json)."""
+    try:
+        return (directory / "assigned").is_dir() or (directory / "dispatch.json").is_file()
+    except OSError:
+        return False
+
+
+def _walk_dirs(start: Path, depth: int, own_team: Optional[Path]) -> list[Path]:
+    """Directories below ``start`` up to ``depth`` levels, never entering task
+    or output trees or another team's workspace."""
+    found: list[Path] = []
+    frontier = [(start, 0)]
+    while frontier:
+        directory, level = frontier.pop()
+        try:
+            children = sorted(child for child in directory.iterdir() if child.is_dir())
+        except OSError:
+            continue
+        for child in children:
+            if child.name.casefold() in _NOT_A_LIBRARY:
+                continue
+            if _is_team_dir(child) and (own_team is None or _lexical(child) != _lexical(own_team)):
+                continue
+            found.append(child)
+            if level + 1 < depth:
+                frontier.append((child, level + 1))
+    return found
+
+
+def _suffix_matches(path: Path, team_dirs: list[Path], depth: int = 2) -> list[Path]:
+    """The declared relative path inside this team's directory tree.
+
+    "data/论文库" may be mounted at /data/<team>/论文库. Only this team's
+    workspace is searched (never another team's), and only the complete
+    declared suffix matches. Callers still require a unique match.
     """
     parts = path.parts[1:] if path.parts and path.parts[0] == "data" and len(path.parts) > 1 else path.parts
     if not parts:
         return []
     suffix = Path(*parts)
     found: list[Path] = []
-    for base in dict.fromkeys(bases):
-        if not base.is_dir():
+    for team in dict.fromkeys(team_dirs):
+        if not team.is_dir():
             continue
-        frontier = [(base, 0)]
-        while frontier:
-            directory, level = frontier.pop()
-            try:
-                children = sorted(child for child in directory.iterdir() if child.is_dir())
-            except OSError:
-                continue
-            for child in children:
-                if child.name.casefold() in _NOT_A_LIBRARY:
-                    continue
-                candidate = child / suffix
-                if candidate.exists():
-                    found.append(candidate)
-                if level + 1 < depth:
-                    frontier.append((child, level + 1))
+        for directory in [team] + _walk_dirs(team, depth, team):
+            candidate = directory / suffix
+            if candidate.exists():
+                found.append(candidate)
     return list(dict.fromkeys(found))
-
 
 def is_material_description(value: object) -> bool:
     """Identify a natural-language paper scope, never a missing concrete path.
@@ -680,28 +707,18 @@ def _fold_name(name: str) -> str:
 _NOT_A_LIBRARY = {"experiments", "assigned", "expert", "figure", "work", "diagnostics"}
 
 
-def _library_like_dirs(bases: list[Path], depth: int = 3) -> list[Path]:
-    """Directories whose name suggests a paper library, outside task/output trees."""
-    found: list[Path] = []
+def _library_like_dirs(bases: list[Path], team_dirs: list[Path], depth: int = 3) -> list[Path]:
+    """Library-like directories in the shared data roots (top level only) or
+    inside this team's workspace; never another team's workspace."""
+    pattern = re.compile(r"论文|文献|paper|pdf|literature", re.IGNORECASE)
+    candidates: list[Path] = []
     for base in dict.fromkeys(bases):
-        if not base.is_dir():
-            continue
-        frontier = [(base, 0)]
-        while frontier:
-            directory, level = frontier.pop()
-            try:
-                children = sorted(child for child in directory.iterdir() if child.is_dir())
-            except OSError:
-                continue
-            for child in children:
-                if child.name.casefold() in _NOT_A_LIBRARY:
-                    continue
-                if re.search(r"论文|文献|paper|pdf|literature", child.name, re.IGNORECASE):
-                    found.append(child)
-                elif level + 1 < depth:
-                    frontier.append((child, level + 1))
-    return list(dict.fromkeys(found))
-
+        if base.is_dir():
+            candidates.extend(_walk_dirs(base, 1, None))
+    for team in dict.fromkeys(team_dirs):
+        if team.is_dir():
+            candidates.extend(_walk_dirs(team, depth, team))
+    return list(dict.fromkeys(directory for directory in candidates if pattern.search(directory.name)))
 
 def resolve_materials(
     materials: object, settings_data_dir: Path, *, allow_library: bool = False,
@@ -723,6 +740,11 @@ def resolve_materials(
     allowed = list(dict.fromkeys([_lexical(base) for base in data_bases] + [base.resolve() for base in data_bases]))
 
     resolved_bases = list(dict.fromkeys(base.resolve() for base in data_bases))
+    team = _team_name()
+    team_dirs = [base / team for base in dict.fromkeys(data_bases) if team and (base / team).is_dir()]
+    # Searched by name: the shared libraries and this team's workspace only.
+    # A whole data root may hold other teams' directories and is never walked.
+    search_roots = [root for root in roots if root.name in ("论文库", "papers")] + team_dirs
 
     def within(path: Path) -> bool:
         # Both the declared location and the real target (after symlinks) must
@@ -756,7 +778,7 @@ def resolve_materials(
         and says to read the library's actual file name.
         """
         if not folded_index:
-            for root in roots:
+            for root in search_roots:
                 if root.is_dir():
                     for value in root.rglob("*"):
                         if value.is_file():
@@ -776,12 +798,12 @@ def resolve_materials(
     def discover_library(*, descriptions_only: bool = False) -> list[Path]:
         declared: list[Path] = []
         libraries = [root for root in roots if root.name in ("论文库", "papers") and root.is_dir()]
-        for root in (libraries if descriptions_only else (libraries or roots)):
+        for root in (libraries if descriptions_only else (libraries or team_dirs)):
             if root.exists():
                 declared.extend(list_pdfs(root))
         if not declared:
             # The library may sit under the team directory or use another name.
-            for directory in _library_like_dirs(data_bases):
+            for directory in _library_like_dirs(data_bases, team_dirs):
                 declared.extend(list_pdfs(directory))
             if declared:
                 logging.getLogger(__name__).warning("material_library_fallback pdfs=%d", len(declared))
@@ -848,11 +870,11 @@ def resolve_materials(
                                      if root.name == suffix.parts[0])
                 found = accept(value for value in exact if value.exists())
                 if len(path.parts) == 1:
-                    found.extend(accept(value for root in roots if root.exists()
+                    found.extend(accept(value for root in search_roots if root.exists()
                                         for value in root.rglob("*") if value.name == path.name))
             found = list(dict.fromkeys(found))
             if not found and not path.is_absolute():
-                found = list(dict.fromkeys(accept(_suffix_matches(path, data_bases))))
+                found = list(dict.fromkeys(accept(_suffix_matches(path, team_dirs))))
                 if found:
                     logging.getLogger(__name__).warning("material_suffix_found matches=%d", len(found))
             if not found and path.suffix:

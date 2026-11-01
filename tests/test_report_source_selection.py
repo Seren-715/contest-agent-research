@@ -246,3 +246,19 @@ def test_idea_gets_a_second_repair_and_keeps_the_draft_with_fewest_blockers(pape
     assert len(client.calls) == 3
     assert "800～4500字符" in client.calls[1][-1]["content"]
     assert payload["markdown"].strip() == good.strip()
+
+
+def test_second_idea_repair_uses_the_kept_draft_not_the_rejected_revision(paper_settings):
+    from handlers.e_idea import IdeaHandler
+    settings, paths = paper_settings
+    good = _markdown([p.name for p in paths])
+    too_long = good.replace("## 参考文献", "补充说明。" * 1500 + "\n\n## 参考文献")  # one blocker
+    worse = "## 引言\n很短的修订稿。"  # rejected: more blockers than the kept draft
+    client = FakeClient([too_long, worse, good])
+    payload = IdeaHandler().handle({"case_id": "E-01", "input": "提出城市绿地温度研究方案",
+                                    "materials": [str(p) for p in paths]}, settings, client)
+    second = client.calls[2]
+    assert second[-2] == {"role": "assistant", "content": too_long.strip()}
+    assert "Idea maximum" in second[-1]["content"]          # the kept draft's own audit
+    assert worse not in "".join(message["content"] for message in second)
+    assert payload["markdown"].strip() == good.strip()

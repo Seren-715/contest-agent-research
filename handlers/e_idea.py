@@ -120,9 +120,12 @@ class IdeaHandler:
                 "保留全部要求的小节，只输出 Markdown 正文。"
                 "正文（标题行和参考文献节除外）必须在800～4500字符之间，目标约3000字符。"
             )
-            messages = messages + [{"role": "assistant", "content": text}, {"role": "user", "content": repair}]
+            # Always repair the draft being kept, with that draft's own audit:
+            # a rejected revision never enters the next conversation.
+            attempt_messages = messages + [{"role": "assistant", "content": markdown},
+                                           {"role": "user", "content": repair}]
             try:
-                text = complete(messages, 0.2)
+                text = complete(attempt_messages, 0.2)
             except (ModelError, TimeoutError):
                 check_active()
                 logging.getLogger(__name__).warning("idea_repair_failed case_id=%s attempt=%d", case_id, attempt + 1)

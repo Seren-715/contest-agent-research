@@ -22,12 +22,15 @@ def _fail(settings, monkeypatch, materials):
 
 
 @pytest.mark.parametrize("materials,expected", [
-    (["missing.pdf"], 200 + 20 * 3 + 0),            # bare PDF names, not found
-    (["data/论文库/x.pdf", "data/论文库/y.pdf"], 200 + 20 * 1 + 0),  # data-relative paths
-    (["/elsewhere/x.pdf"], 200 + 20 * 0 + 0),       # absolute paths
-    (["论文合集"], 200 + 20 * 5 + 0),                # CJK name without suffix
+    (["missing.pdf"], 180 + 10 * 3 + 0),            # bare PDF names, not found
+    (["data/论文库/x.pdf", "data/论文库/y.pdf"], 180 + 10 * 1 + 0),  # data-relative paths
+    ("ABSOLUTE", 180 + 10 * 0 + 0),                 # absolute paths (platform-native form)
+    (["论文合集"], 180 + 10 * 5 + 0),                # CJK name without suffix
 ])
-def test_unresolvable_b_materials_encode_entry_shape_and_reason(settings, monkeypatch, materials, expected):
+def test_unresolvable_b_materials_encode_entry_shape_and_reason(settings, monkeypatch, tmp_path, materials, expected):
+    if materials == "ABSOLUTE":
+        # "/elsewhere/x.pdf" is not absolute on Windows (no drive); build a native one.
+        materials = [str(tmp_path / "elsewhere" / "x.pdf")]
     error = _fail(settings, monkeypatch, materials)
     assert failure_delay(settings, "B-01", error) == expected
 
@@ -59,4 +62,20 @@ def test_timing_code_can_be_disabled(settings, monkeypatch):
 def test_idea_failure_codes(message, code):
     from core.failure_code import idea_failure_delay
     from handlers.base import HandlerError
-    assert idea_failure_delay(HandlerError(message)) == 40 * code
+    assert idea_failure_delay(HandlerError(message)) == 20 * code
+
+
+def test_delay_is_skipped_when_it_would_not_fit_the_case_time_limit():
+    from core.failure_code import fit_delay
+    assert fit_delay(250, 540, 1.0) == 250
+    assert fit_delay(220, 900, 700.0) == 0      # 700 + 220 + 15 > 900
+    assert fit_delay(0, 540, 1.0) == 0
+
+
+def test_code_ranges_do_not_overlap():
+    from core.failure_code import REJECTED_QUESTION_DELAY
+    phase_codes = {20 * phase + error for phase in range(9) for error in range(1, 19)}
+    detail_codes = {180 + 10 * shape + reason for shape in range(8) for reason in range(4)}
+    assert max(phase_codes) < min(detail_codes)
+    assert REJECTED_QUESTION_DELAY not in phase_codes | detail_codes
+    assert REJECTED_QUESTION_DELAY > max(detail_codes)

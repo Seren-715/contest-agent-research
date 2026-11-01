@@ -91,7 +91,8 @@ def test_parent_traversal_is_still_rejected(mount):
 
 
 @pytest.mark.parametrize("folder", ["t/论文库", "pdfs", "t/Papers_2026"])
-def test_description_discovers_a_library_with_another_name_or_under_the_team(mount, folder):
+def test_description_discovers_a_library_with_another_name_or_under_the_team(mount, monkeypatch, folder):
+    monkeypatch.setenv("RESEARCH_WORKSPACE_TEAM", "t")
     data, root = mount
     paper = _pdf(root / folder / "a.pdf")
     _pdf(root / "experiments" / "D-01" / "method.pdf")  # task material, not the library
@@ -175,17 +176,38 @@ def test_report_selection_uses_an_existing_description_like_folder_directly(moun
     assert paths == designated and not client.calls  # no model selection, no other folder
 
 
-def test_data_relative_path_is_found_one_level_deeper_under_a_team_folder(mount):
+def test_data_relative_path_is_found_inside_this_teams_folder(mount, monkeypatch):
+    monkeypatch.setenv("RESEARCH_WORKSPACE_TEAM", "my-team")
     data, root = mount
     paper = _pdf(root / "my-team" / "论文库" / "x.pdf")
-    _pdf(root / "experiments" / "论文库" / "x.pdf")  # task tree: never searched
+    (root / "my-team" / "assigned").mkdir()
+    _pdf(root / "my-team" / "experiments" / "论文库" / "x.pdf")  # task tree: never searched
     assert resolve_materials(["data/论文库/x.pdf"], data) == [paper]
     assert resolve_materials(["data/论文库"], data) == [paper]
 
 
-def test_deeper_suffix_match_must_be_unique(mount):
+def test_deeper_suffix_match_inside_the_team_must_be_unique(mount, monkeypatch):
+    monkeypatch.setenv("RESEARCH_WORKSPACE_TEAM", "my-team")
     data, root = mount
-    _pdf(root / "team-a" / "论文库" / "x.pdf", b"%PDF-a")
-    _pdf(root / "team-b" / "论文库" / "x.pdf", b"%PDF-b")
+    _pdf(root / "my-team" / "a" / "论文库" / "x.pdf", b"%PDF-a")
+    _pdf(root / "my-team" / "b" / "论文库" / "x.pdf", b"%PDF-b")
     with pytest.raises(MaterialResolutionError, match="ambiguous"):
         resolve_materials(["data/论文库/x.pdf"], data)
+
+
+@pytest.mark.parametrize("team", ["my-team", None])
+def test_another_teams_workspace_is_never_searched(mount, monkeypatch, team):
+    if team:
+        monkeypatch.setenv("RESEARCH_WORKSPACE_TEAM", team)
+        (mount[1] / team / "assigned").mkdir(parents=True)  # our workspace has no library
+    for key in ("TEAM_ID", "CONTEST_TEAM") + (() if team else ("RESEARCH_WORKSPACE_TEAM",)):
+        monkeypatch.delenv(key, raising=False)
+    data, root = mount
+    other = root / "other-team"
+    (other / "assigned").mkdir(parents=True)
+    _pdf(other / "论文库" / "x.pdf")
+    _pdf(other / "papers_private" / "y.pdf")
+    for declared in (["data/论文库/x.pdf"], ["data/论文库"], ["x.pdf"], ["X.PDF"], ["y.pdf"]):
+        with pytest.raises(MaterialResolutionError, match="not found"):
+            resolve_materials(declared, data)
+    assert resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True) == []

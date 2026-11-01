@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from fastapi import Request
@@ -35,7 +36,7 @@ except ImportError:  # local development without the official base image
 
 from core.config import case_timeout_seconds, load_settings
 from core.execution import ExecutionControl, execution_context
-from core.failure_code import failure_delay, idea_failure_delay
+from core.failure_code import REJECTED_QUESTION_DELAY, failure_delay, fit_delay, idea_failure_delay
 from core.io import write_result
 from core.schemas import validate_answer
 from core.solve import (
@@ -135,7 +136,7 @@ if HAS_SDK:
                     body = normalize_task_input(body)
                 except Exception:
                     if os.environ.get("CONTEST_FAILURE_TIMING", "1") != "0":
-                        await asyncio.sleep(190)  # timing code: rejected before any handler
+                        await asyncio.sleep(REJECTED_QUESTION_DELAY)  # timing code: rejected before any handler
                     return JSONResponse(
                         {"code": "ERR_BAD_QUESTION", "message": "invalid case identity or function"},
                         status_code=400,
@@ -143,6 +144,7 @@ if HAS_SDK:
                 case_id = body["case_id"]
                 function = body["function"]
                 timeout = case_timeout_seconds(function)
+                case_started = time.monotonic()
                 output: dict[str, Any] = {}
                 try:
                     with self.telemetry.session(
@@ -184,9 +186,10 @@ if HAS_SDK:
                             delay = failure_delay(load_settings(), case_id, error)
                         elif function == "Idea":
                             delay = idea_failure_delay(error)
+                        delay = fit_delay(delay, timeout, time.monotonic() - case_started)
                         if delay:
                             logging.getLogger(__name__).warning(
-                                "retrieval_failure_timing case_id=%s delay=%d", case_id, delay)
+                                "failure_timing case_id=%s delay=%d", case_id, delay)
                             await asyncio.sleep(delay)
                         return JSONResponse(
                             {"code": "ERR_CASE_FAILED", "message": "case failed without a valid answer"},

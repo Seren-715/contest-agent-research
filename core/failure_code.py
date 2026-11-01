@@ -4,7 +4,8 @@ The platform shows no logs, only per-case "纯处理耗时". When a retrieval ca
 fails, the /solve handler waits ``20 * phase + error`` seconds before
 answering. Reading the processing time back gives the last recorded phase and
 the error class. The failed case scores 0 either way; disable with
-CONTEST_FAILURE_TIMING=0. Decoding table: docs/BC_SOURCE_ANALYSIS_20261031.md.
+CONTEST_FAILURE_TIMING=0. A delay that would not fit in the case's remaining
+time limit is skipped entirely (see fit_delay). Decoding table: docs/BC_SOURCE_ANALYSIS_20261031.md.
 """
 from __future__ import annotations
 
@@ -85,14 +86,14 @@ def _chain(error: BaseException) -> list[BaseException]:
 
 
 def _unresolved_detail(error: BaseException) -> int | None:
-    """200 + 20 * dominant entry shape + dominant skip reason, for B's
-    "no declared material could be resolved" (eval-20261101: all B cases)."""
+    """180 + 10 * dominant entry shape + dominant skip reason (180-253 s), for
+    B's "no declared material could be resolved" (eval-20261101: all B cases)."""
     for exc in _chain(error):
         shapes, skipped = getattr(exc, "shapes", None), getattr(exc, "skipped", None)
         if shapes or skipped:
             shape = max(shapes.items(), key=lambda item: (item[1], -SHAPES.get(item[0], 7)))[0] if shapes else "other"
             reason = max(skipped.items(), key=lambda item: (item[1], -SKIP_REASONS.get(item[0], 3)))[0] if skipped else "not_found"
-            return 200 + 20 * SHAPES.get(shape, 7) + SKIP_REASONS.get(reason, 3)
+            return 180 + 10 * SHAPES.get(shape, 7) + SKIP_REASONS.get(reason, 3)
     return None
 
 
@@ -107,7 +108,7 @@ def failure_delay(settings: Settings, case_id: str, error: BaseException) -> int
     return 20 * phase + _error_code(error)
 
 
-# Idea failures: 40 s per code (normal processing already takes ~10-20 s).
+# Idea failures: 20 s per code (normal processing already takes ~10-20 s).
 # Most specific markers first: several messages contain "引用".
 IDEA_REASONS = [
     ("characters; Idea maximum", 1),          # body too long
@@ -122,6 +123,18 @@ IDEA_REASONS = [
 ]
 
 
+IDEA_STEP = 20
+# The 400 path (question rejected before any handler) waits a fixed time
+# outside both ranges above (B: 0-178 and 180-253; Idea: 20-220).
+REJECTED_QUESTION_DELAY = 270
+
+
+def fit_delay(delay: int, case_timeout: float, elapsed: float, margin: float = 15.0) -> int:
+    """The delay if it fits in what is left of the case time limit, else 0:
+    a truncated delay would decode wrongly, and a platform timeout is worse."""
+    return delay if delay > 0 and elapsed + delay + margin <= case_timeout else 0
+
+
 def idea_failure_delay(error: BaseException) -> int:
     """Seconds to wait before reporting a failed Idea case (0 = disabled)."""
     if os.environ.get("CONTEST_FAILURE_TIMING", "1") == "0":
@@ -129,12 +142,12 @@ def idea_failure_delay(error: BaseException) -> int:
     names = {cls.__name__ for exc in _chain(error) for cls in type(exc).__mro__}
     text = " ".join(str(exc) for exc in _chain(error))
     if "ModelError" in names:
-        return 40 * 8
+        return IDEA_STEP * 8
     if "TimeoutError" in names:
-        return 40 * 9
+        return IDEA_STEP * 9
     if "MaterialResolutionError" in names:
-        return 40 * 10
+        return IDEA_STEP * 10
     for marker, code in IDEA_REASONS:
         if marker in text:
-            return 40 * code
-    return 40 * 11
+            return IDEA_STEP * code
+    return IDEA_STEP * 11
