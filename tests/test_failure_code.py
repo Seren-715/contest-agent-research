@@ -25,7 +25,6 @@ def _fail(settings, monkeypatch, materials):
     (["missing.pdf"], 180 + 10 * 3 + 0),            # bare PDF names, not found
     (["data/论文库/x.pdf", "data/论文库/y.pdf"], 180 + 10 * 1 + 0),  # data-relative paths
     ("ABSOLUTE", 180 + 10 * 0 + 0),                 # absolute paths (platform-native form)
-    (["论文合集"], 180 + 10 * 5 + 0),                # CJK name without suffix
 ])
 def test_unresolvable_b_materials_encode_entry_shape_and_reason(settings, monkeypatch, tmp_path, materials, expected):
     if materials == "ABSOLUTE":
@@ -33,6 +32,13 @@ def test_unresolvable_b_materials_encode_entry_shape_and_reason(settings, monkey
         materials = [str(tmp_path / "elsewhere" / "x.pdf")]
     error = _fail(settings, monkeypatch, materials)
     assert failure_delay(settings, "B-01", error) == expected
+
+
+def test_cjk_scope_without_any_library_decodes_as_empty_scope(settings, monkeypatch):
+    # B reads unmatched Chinese prose as the library scope; with no library
+    # on disk that is phase 3 (materials resolved) + error 19, not 230.
+    error = _fail(settings, monkeypatch, ["论文合集"])
+    assert failure_delay(settings, "B-01", error) == 20 * 3 + 19
 
 
 def test_non_pdf_material_decodes_as_header_check(settings, monkeypatch):
@@ -74,7 +80,7 @@ def test_delay_is_skipped_when_it_would_not_fit_the_case_time_limit():
 
 def test_code_ranges_do_not_overlap():
     from core.failure_code import REJECTED_QUESTION_DELAY
-    phase_codes = {20 * phase + error for phase in range(9) for error in range(1, 19)}
+    phase_codes = {20 * phase + error for phase in range(9) for error in range(1, 20)}
     detail_codes = {180 + 10 * shape + reason for shape in range(8) for reason in range(4)}
     assert max(phase_codes) < min(detail_codes)
     assert REJECTED_QUESTION_DELAY not in phase_codes | detail_codes

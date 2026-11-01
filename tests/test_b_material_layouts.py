@@ -53,6 +53,50 @@ def test_missing_entry_is_never_reinterpreted_as_a_library_description(mount, en
     assert resolve_materials([entry, "a.pdf"], data, allow_descriptions=True, lenient=True) == [paper]
 
 
+# eval 2026-11-01 06:21: all three B cases waited 230 s = 180 + 10 * 5 + 0,
+# i.e. every declared entry was Chinese without an extension and not found.
+@pytest.mark.parametrize("entry", ["论文库中的全部论文", "2024论文资料", "全部 PDF 论文"])
+def test_b_reads_unmatched_chinese_prose_as_the_library_scope(mount, entry):
+    data, root = mount
+    a = _pdf(root / "论文库" / "a.pdf")
+    b = _pdf(root / "论文库" / "sub" / "b.pdf")
+    _pdf(root / "experiments" / "D-01" / "method.pdf")  # task material, not the library
+    found = resolve_materials([entry], data, allow_descriptions=True, lenient=True, prose_scope=True)
+    assert sorted(found) == sorted([a, b])
+    # An explicit paper in the same list still bounds the scope.
+    assert resolve_materials([entry, "a.pdf"], data, allow_descriptions=True, lenient=True,
+                             prose_scope=True) == [a]
+
+
+@pytest.mark.parametrize("entry", ["important_folder", "missing.pdf", "论文/缺失.pdf", "论文集.txt", "论文库/子目录"])
+def test_prose_scope_never_covers_names_paths_or_files(mount, entry):
+    data, root = mount
+    _pdf(root / "论文库" / "a.pdf")
+    with pytest.raises(MaterialResolutionError, match="could be resolved"):
+        resolve_materials([entry], data, allow_descriptions=True, lenient=True, prose_scope=True)
+
+
+def test_b_case_with_a_chinese_scope_phrase_reaches_the_model(settings, monkeypatch, tmp_path):
+    from fpdf import FPDF
+    mount = tmp_path / "readonly"
+    monkeypatch.setenv("DATA_PATH", str(mount))
+    path = mount / "论文库" / "Adaptive_Decoding.pdf"
+    path.parent.mkdir(parents=True)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=10)
+    pdf.multi_cell(0, 5, "Adaptive decoding for language inference throughput.")
+    pdf.output(str(path))
+    reply = json.dumps({"papers": [{"filename": "Adaptive_Decoding.pdf", "reason": "原文研究自适应解码与推理吞吐量。"}]},
+                       ensure_ascii=False)
+    client = FakeClient([reply])
+    monkeypatch.setattr(solve, "model_client", lambda settings: client)
+    result = solve.solve_task({"case_id": "B-01", "function": "Literature_Retrieval",
+                               "input": "adaptive decoding", "materials": ["论文库中的全部论文"]}, settings)
+    assert len(client.calls) == 1
+    assert [item["filename"] for item in result["papers"]] == ["Adaptive_Decoding.pdf"]
+
+
 def _symlink(link, target):
     link.parent.mkdir(parents=True, exist_ok=True)
     try:

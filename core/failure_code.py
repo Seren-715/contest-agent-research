@@ -40,6 +40,7 @@ ERRORS = [
     ("HandlerError", "retrieval materials contain no recognizable PDFs", 9),
     ("HandlerError", "retrieval materials have no extractable evidence", 10),
     ("HandlerError", "retrieval failed before any valid rerank response", 11),
+    ("HandlerError", "retrieval scope contains no papers", 19),
     ("HandlerError", "", 12),
     ("ModelError", "", 13),
     ("TimeoutError", "", 14),

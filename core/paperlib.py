@@ -633,6 +633,22 @@ def is_material_description(value: object) -> bool:
                           text, re.IGNORECASE))
 
 
+def is_scope_prose(value: object) -> bool:
+    """Chinese prose that names no file: no path separator, glob or extension.
+
+    Platform B cases (eval 2026-11-01 06:21, timing code 230) declare their
+    search scope in Chinese without the scope words is_material_description()
+    requires, e.g. a phrase about the paper library. Only whole-library
+    retrieval opts in to reading such an unmatched entry as a description.
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or re.search(r"[\\/:*?]", text) or re.search(r"\.[a-zA-Z0-9]{1,12}(?:\s|$)", text):
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
 def describe_material_scope(materials: object) -> list[str]:
     """Return declared descriptions for a caller's explicit selection stage."""
     values = [materials] if isinstance(materials, str) else materials
@@ -722,7 +738,7 @@ def _library_like_dirs(bases: list[Path], team_dirs: list[Path], depth: int = 3)
 
 def resolve_materials(
     materials: object, settings_data_dir: Path, *, allow_library: bool = False,
-    allow_descriptions: bool = False, lenient: bool = False,
+    allow_descriptions: bool = False, lenient: bool = False, prose_scope: bool = False,
 ) -> list[Path]:
     """Resolve declared materials; description discovery needs explicit opt-in.
 
@@ -731,6 +747,8 @@ def resolve_materials(
     Description-only discovery returns candidates, not a selected C/E corpus.
     ``lenient`` (retrieval over a whole library) skips a missing or ambiguous
     entry instead of failing the case; it never substitutes another file.
+    ``prose_scope`` (B only) also reads unmatched Chinese prose without any
+    path or extension as a description (see is_scope_prose()).
     """
     skipped: list[str] = []
     roots = _paper_roots(settings_data_dir)
@@ -886,7 +904,7 @@ def resolve_materials(
             # nothing on disk may be a description, and only if it carries the
             # explicit scope wording is_material_description() requires; any
             # other missing entry stays not-found and never widens the scope.
-            if not found and is_material_description(item):
+            if not found and (is_material_description(item) or (prose_scope and is_scope_prose(item))):
                 if not allow_descriptions:
                     raise MaterialResolutionError("descriptive material scope requires explicit selection")
                 descriptions.append(item)

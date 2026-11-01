@@ -244,9 +244,14 @@ class RetrievalHandler:
         query = question_text(question)
         record_stage(settings, case_id, "material_resolution")
         paths = resolve_materials(question.get("materials"), settings.data_dir,
-                                  allow_library=True, allow_descriptions=True, lenient=True)
+                                  allow_library=True, allow_descriptions=True, lenient=True,
+                                  prose_scope=True)
         record_stage(settings, case_id, "materials_resolved", resolved_count=len(paths))
         if not paths:
+            if question.get("materials"):
+                # A declared scope that holds no paper: a timing code, not a
+                # silent empty answer.
+                raise HandlerError("retrieval scope contains no papers")
             return {"case_id": case_id, "papers": []}
         # Do not trust extensions: keep only files that actually look like PDFs.
         resolved_count = len(paths)
