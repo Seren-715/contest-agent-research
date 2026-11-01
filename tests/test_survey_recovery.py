@@ -195,7 +195,36 @@ def test_core_passages_use_discussion_when_no_conclusion_and_stop_at_references(
     parts = {label: (page, quote) for label, page, quote in core_passages(record)}
     assert parts["摘要"][1].startswith("We introduce Foo, which is 2.0x faster.")
     assert parts["摘要"][1] == "We introduce Foo, which is 2.0x faster."
-    assert parts["贡献陈述"][0] == 2
+    assert parts["贡献陈述"][0] == (2, 3)  # the window continues onto page 3
+    assert "[PDF页3]" in parts["贡献陈述"][1]
     assert parts["贡献陈述"][1].startswith("In summary, the paper makes the following contributions: a goodput metric.")
-    assert parts["结论"][0] == 5
+    assert parts["结论"][0] == (5,)
     assert "We presented Foo" in parts["结论"][1] and "Someone" not in parts["结论"][1]
+
+
+def test_core_window_never_joins_a_non_adjacent_page_and_labels_every_page():
+    from handlers.reporting import core_evidence, core_passages
+    # Page 2 was not indexed (time limit): page 3 must not appear as page 1.
+    pages = [(1, "Abstract\nShort abstract of Foo."), (3, "PAGE-THREE results 9.9x."), (4, "More."),
+             (5, "Body."), (6, "7 Conclusion\nFoo works."), (7, "Next page text.")]
+    record = MaterialRecord(path=Path("g.pdf"), filename="g.pdf", sha256="", bytes=0, pages=7, title="Foo",
+                            abstract="", text="",
+                            passages=tuple(EvidencePassage(page, 0, len(text), text) for page, text in pages))
+    parts = {label: (pages_, quote) for label, pages_, quote in core_passages(record)}
+    assert parts["摘要"] == ((1,), "Short abstract of Foo.")
+    assert parts["结论"][0] == (6, 7) and "[PDF页7] Next page text." in parts["结论"][1]
+    block = core_evidence([record])
+    assert "（摘要，PDF页1）Short abstract of Foo." in block
+    assert "（结论，PDF页6-7）" in block
+    assert "PAGE-THREE" not in block
+
+
+def test_core_window_does_not_continue_into_references_on_the_next_page():
+    from handlers.reporting import core_passages
+    pages = [(1, "Abstract\nFoo."), (2, "B."), (3, "C."), (4, "8 Conclusion\nFoo wins 3.2x."),
+             (5, "References\n[1] Someone. 2020.")]
+    record = MaterialRecord(path=Path("h.pdf"), filename="h.pdf", sha256="", bytes=0, pages=5, title="Foo",
+                            abstract="", text="",
+                            passages=tuple(EvidencePassage(page, 0, len(text), text) for page, text in pages))
+    parts = {label: (used, quote) for label, used, quote in core_passages(record)}
+    assert parts["结论"] == ((4,), "8 Conclusion Foo wins 3.2x.")

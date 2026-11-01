@@ -56,7 +56,10 @@ def _required_count(question: dict[str, Any]) -> int | None:
     text = " ".join(str(value) for value in fields if value)
     number = r"(\d+|[零一二两三四五六七八九十]{1,3})"
     counts = []
-    for pattern in (r"至少\s*" + number + r"\s*篇", number + r"\s*篇\s*(?:指定|实际引用的|相关)?\s*(?:论文|文献|材料|PDF)",
+    unit = r"\s*(?:篇|项|份|个)"
+    work = r"\s*(?:指定|实际引用的|相关)?\s*的?\s*(?:论文|文献|材料|PDF|研究|工作)"
+    for pattern in (r"(?:至少|不少于|不低于|最少)\s*(?:引用|列出|使用|包含|涵盖|比较)?\s*" + number + unit,
+                    number + unit + work,
                     r"at\s+least\s+(\d+)\s+(?:[\w-]+\s+){0,3}?(?:papers?|sources?|articles?|studies)",
                     r"(\d+)\s+(?:designated|specified)\s+papers?"):
         for match in re.finditer(pattern, text, re.IGNORECASE):
@@ -168,12 +171,13 @@ def select_report_materials(
                 selected.setdefault(name, {"filename": name, "reason": reason.strip(), "sha256": by_name[name].sha256,
                                            "confidence": confidence})
     # Core papers are never cut: a parsed count can be incomplete ("at least
-    # 5 ... and at least 10 ..."). Uncertain same-topic papers fill up to two
-    # beyond the count, because a missed designated paper loses citation
-    # credit while an extra one does not (scoring rules, 引文溯源类).
+    # 5 ... and at least 10 ..."). Uncertain same-topic papers are cut only
+    # against a count the task states, and only beyond count + 2: a missed
+    # designated paper loses citation credit while an extra one does not
+    # (scoring rules, 引文溯源类). An unparsed count ("十余项") cuts nothing.
     core_names = [name for name, item in selected.items() if item["confidence"] == "core"]
     possible = [name for name, item in selected.items() if item["confidence"] == "possible"]
-    kept = core_names + possible[:max(0, required + 2 - len(core_names))]
+    kept = core_names + (possible if stated is None else possible[:max(0, stated + 2 - len(core_names))])
     dropped = [name for name in possible if name not in kept]
     if dropped:
         logging.getLogger(__name__).warning("report_selection_possible_dropped case_id=%s count=%d", case_id, len(dropped))

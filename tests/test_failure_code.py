@@ -25,6 +25,7 @@ def _fail(settings, monkeypatch, materials):
     (["missing.pdf"], 180 + 10 * 3 + 0),            # bare PDF names, not found
     (["data/论文库/x.pdf", "data/论文库/y.pdf"], 180 + 10 * 1 + 0),  # data-relative paths
     ("ABSOLUTE", 180 + 10 * 0 + 0),                 # absolute paths (platform-native form)
+    (["论文合集"], 180 + 10 * 5 + 0),                # CJK name without suffix: a name, not a scope
 ])
 def test_unresolvable_b_materials_encode_entry_shape_and_reason(settings, monkeypatch, tmp_path, materials, expected):
     if materials == "ABSOLUTE":
@@ -37,7 +38,7 @@ def test_unresolvable_b_materials_encode_entry_shape_and_reason(settings, monkey
 def test_cjk_scope_without_any_library_decodes_as_empty_scope(settings, monkeypatch):
     # B reads unmatched Chinese prose as the library scope; with no library
     # on disk that is phase 3 (materials resolved) + error 19, not 230.
-    error = _fail(settings, monkeypatch, ["论文合集"])
+    error = _fail(settings, monkeypatch, ["论文库中的全部论文"])
     assert failure_delay(settings, "B-01", error) == 20 * 3 + 19
 
 

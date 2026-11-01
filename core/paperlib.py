@@ -634,19 +634,24 @@ def is_material_description(value: object) -> bool:
 
 
 def is_scope_prose(value: object) -> bool:
-    """Chinese prose that names no file: no path separator, glob or extension.
+    """Chinese prose describing a whole collection of papers.
 
     Platform B cases (eval 2026-11-01 06:21, timing code 230) declare their
     search scope in Chinese without the scope words is_material_description()
-    requires, e.g. a phrase about the paper library. Only whole-library
-    retrieval opts in to reading such an unmatched entry as a description.
+    requires, e.g. "论文库中的全部论文". Only whole-library retrieval opts in.
+    A bare name such as "2024论文资料" or "论文库" is a name that was not
+    found, never a description: it needs a collective or locative word
+    (全部/所有/中的/内的/范围...) together with a paper word, and no path
+    separator, glob or extension.
     """
     if not isinstance(value, str):
         return False
     text = value.strip()
     if not text or re.search(r"[\\/:*?]", text) or re.search(r"\.[a-zA-Z0-9]{1,12}(?:\s|$)", text):
         return False
-    return bool(re.search(r"[\u4e00-\u9fff]", text))
+    collective = re.search(r"全部|所有|全体|整个|中的|内的|里的|之中|范围|以内", text)
+    papers = re.search(r"论文|文献|PDF|资料|材料", text, re.IGNORECASE)
+    return bool(collective and papers)
 
 
 def describe_material_scope(materials: object) -> list[str]:

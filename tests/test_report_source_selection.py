@@ -200,6 +200,9 @@ def test_selection_is_never_trimmed_even_against_an_incomplete_count(settings, t
     ({"input": "至少 5 篇", "constraints": ["至少引用十篇指定论文"]}, 10),
     ({"input": "Cite at least 8 papers"}, 8),
     ({"input": "Use at least 5 papers and at least 10 peer-reviewed papers"}, 10),
+    ({"input": "撰写综述，至少引用十项相关研究"}, 10),
+    ({"input": "参考文献不少于 8 篇"}, 8),
+    ({"input": "比较 6 项指定研究"}, 6),
 ])
 def test_required_count_is_read_from_the_task(question, expected):
     from core.materials import _required_count
@@ -285,3 +288,16 @@ def test_possible_papers_fill_up_to_two_beyond_the_count_and_core_is_never_cut(s
     assert paths == z[:8]
     paths = select_report_materials(question, settings, FakeClient([labelled(z[:7], z[7:8])]), Deadline(900))
     assert paths == z[:7]
+
+
+@pytest.mark.parametrize("task,count", [("撰写电池回收综述，至少引用十项相关研究", 10), ("撰写电池回收综述", 9),
+                                        ("撰写综述，需覆盖十余项工作", 11)])
+def test_possible_papers_are_never_cut_below_a_count_the_task_may_require(settings, tmp_path, monkeypatch, task, count):
+    records = _library(tmp_path, monkeypatch, designated=count)
+    z = [r.path for r in records if r.filename.startswith("z")]
+    reply = json.dumps({"papers": [{"filename": p.name, "confidence": "possible", "reason": "同主题但不确定是否属于指定组。"}
+                                   for p in z]}, ensure_ascii=False)
+    paths = select_report_materials({"case_id": "C-01", "input": task,
+                                     "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                    settings, FakeClient([reply]), Deadline(900))
+    assert paths == z

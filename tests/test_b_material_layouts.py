@@ -55,7 +55,7 @@ def test_missing_entry_is_never_reinterpreted_as_a_library_description(mount, en
 
 # eval 2026-11-01 06:21: all three B cases waited 230 s = 180 + 10 * 5 + 0,
 # i.e. every declared entry was Chinese without an extension and not found.
-@pytest.mark.parametrize("entry", ["论文库中的全部论文", "2024论文资料", "全部 PDF 论文"])
+@pytest.mark.parametrize("entry", ["论文库中的全部论文", "全部 PDF 论文", "检索范围：论文库内的所有文献"])
 def test_b_reads_unmatched_chinese_prose_as_the_library_scope(mount, entry):
     data, root = mount
     a = _pdf(root / "论文库" / "a.pdf")
@@ -68,8 +68,11 @@ def test_b_reads_unmatched_chinese_prose_as_the_library_scope(mount, entry):
                              prose_scope=True) == [a]
 
 
-@pytest.mark.parametrize("entry", ["important_folder", "missing.pdf", "论文/缺失.pdf", "论文集.txt", "论文库/子目录"])
+@pytest.mark.parametrize("entry", ["important_folder", "missing.pdf", "论文/缺失.pdf", "论文集.txt", "论文库/子目录",
+                                   "2024论文资料", "论文合集", "电池回收论文"])
 def test_prose_scope_never_covers_names_paths_or_files(mount, entry):
+    # A missing Chinese folder or file name is a name, not a scope description:
+    # it must never widen to the rest of the library.
     data, root = mount
     _pdf(root / "论文库" / "a.pdf")
     with pytest.raises(MaterialResolutionError, match="could be resolved"):

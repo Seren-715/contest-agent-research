@@ -174,60 +174,74 @@ def _page_texts(record: MaterialRecord) -> list[tuple[int, str]]:
     return sorted(pages.items())
 
 
-def _window(pages: list[tuple[int, str]], index: int, start: int, size: int) -> tuple[int, int, str]:
+def _window(pages: list[tuple[int, str]], index: int, start: int, size: int) -> tuple[tuple[int, ...], str]:
+    """Quote from one page, continued onto the next page only if it is the
+    adjacent PDF page (an unindexed page in between would hide a gap). The
+    continuation is marked inline and every page is returned for the label."""
     page, text = pages[index]
-    quote = text[start:start + size]
-    if len(quote) < size and index + 1 < len(pages):
-        quote += "\n" + pages[index + 1][1][:size - len(quote)]
-    return page, start, " ".join(quote.split())
+    quote = " ".join(text[start:start + size].split())
+    used = (page,)
+    # A continuation shorter than a sentence fragment only adds noise.
+    if size - len(quote) >= 80 and index + 1 < len(pages) and page and pages[index + 1][0] == page + 1:
+        raw = pages[index + 1][1]
+        back = _BACK_MATTER.search(raw)  # never continue into references
+        following = " ".join(raw[:back.start() if back else len(raw)].split())[:max(0, size - len(quote))]
+        if following:
+            quote += f" [PDF页{page + 1}] " + following
+            used = (page, page + 1)
+    return used, quote
 
 
 def core_passages(record: MaterialRecord, *, abstract_chars: int = 1500, contribution_chars: int = 900,
-                  conclusion_chars: int = 1200) -> list[tuple[str, int, str]]:
+                  conclusion_chars: int = 1200) -> list[tuple[str, tuple[int, ...], str]]:
     """Verbatim abstract, contribution statement and conclusion of one paper.
 
     Headline claims and numbers usually sit there. Query ranking with a
     Chinese task over English papers does not guarantee these spans reach the
     prompt, so they are located by section wording instead. Returns
-    (label, page, quote); a part that cannot be located is left out.
+    (label, pages, quote); a part that cannot be located is left out.
     """
     pages = _page_texts(record)
-    found: list[tuple[str, int, str]] = []
+    found: list[tuple[str, tuple[int, ...], str]] = []
     for index, (page, text) in enumerate(pages[:3]):
         match = _ABSTRACT_HEAD.search(text) or re.search(r"(?i)\babstract\b[\s.:：—-]*", text)
         if match:
-            page, _, quote = _window(pages, index, match.end(), abstract_chars)
+            used, quote = _window(pages, index, match.end(), abstract_chars)
             # The window is whitespace-joined: match the heading inline.
             intro = re.search(r"(?i)\b(?:1|I)\.?\s+introduction\b", quote)
-            found.append(("摘要", page, quote[:intro.start()].strip() if intro and intro.start() > 20 else quote))
+            if intro and intro.start() > 20:
+                quote = quote[:intro.start()].strip()
+                if f"[PDF页{used[-1]}]" not in quote:
+                    used = used[:1]
+            found.append(("摘要", used, quote))
             break
     else:
         if pages:
-            page, _, quote = _window(pages, 0, 0, abstract_chars)
-            found.append(("首页", page, quote))
+            used, quote = _window(pages, 0, 0, abstract_chars)
+            found.append(("首页", used, quote))
     for index, (page, text) in enumerate(pages[:6]):
         match = _CONTRIBUTION.search(text)
         if match:
-            page, _, quote = _window(pages, index, match.start(), contribution_chars)
-            found.append(("贡献陈述", page, quote))
+            used, quote = _window(pages, index, match.start(), contribution_chars)
+            found.append(("贡献陈述", used, quote))
             break
     for heading in (_CONCLUSION_HEAD, _DISCUSSION_HEAD):
         located = False
         for index in range(len(pages) - 1, len(pages) // 3 - 1, -1):
-            page, text = pages[index]
+            _, text = pages[index]
             matches = list(heading.finditer(text))
             if matches:
                 start = matches[-1].start()
                 back = _BACK_MATTER.search(text, matches[-1].end())
-                page, _, quote = _window(pages, index, start, conclusion_chars)
-                if back is not None and back.start() - start < conclusion_chars:
-                    page, _, quote = _window(pages, index, start, back.start() - start)
-                found.append(("结论", page, quote))
+                size = back.start() - start if back is not None and back.start() - start < conclusion_chars \
+                    else conclusion_chars
+                used, quote = _window(pages, index, start, size)
+                found.append(("结论", used, quote))
                 located = True
                 break
         if located:
             break
-    return [(label, page, quote) for label, page, quote in found if quote.strip()]
+    return [(label, used, quote) for label, used, quote in found if quote.strip()]
 
 
 def core_evidence(records: list[MaterialRecord], **limits: int) -> str:
@@ -236,7 +250,8 @@ def core_evidence(records: list[MaterialRecord], **limits: int) -> str:
     for index, record in enumerate(records, start=1):
         check_active()
         parts = core_passages(record, **limits)
-        lines = [f"（{label}，" + (f"PDF页{page}" if page else "页码未定位") + f"）{quote}" for label, page, quote in parts]
+        lines = [f"（{label}，" + ("PDF页" + "-".join(map(str, used)) if used and used[0] else "页码未定位")
+                 + f"）{quote}" for label, used, quote in parts]
         located = {label for label, _, _ in parts}
         missing = [label for label in ("摘要", "贡献陈述", "结论") if label not in located and not
                    (label == "摘要" and "首页" in located)]
