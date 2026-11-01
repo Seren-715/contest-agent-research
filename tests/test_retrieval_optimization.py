@@ -363,3 +363,30 @@ def test_small_library_skips_the_screen(settings, tmp_path, monkeypatch):
     RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
     assert client.screen_calls == []
     assert sum(len(call) for call in client.verify_calls) == 30
+
+
+def test_screen_out_of_time_passes_unscreened_papers_through(settings, tmp_path):
+    from handlers.b_retrieval import RetrievalLimits, _screen
+
+    def make(name):
+        return MaterialRecord(path=tmp_path / name, filename=name, sha256="t", bytes=1, pages=1,
+                              title=name, abstract="Adaptive decoding", text="Adaptive decoding")
+
+    ranked = [(make("first.pdf"), 1.0), (make("second.pdf"), 0.5)]
+
+    class Clock:
+        """Plenty of time for the first batch, then too little for another."""
+        def __init__(self):
+            self.values = [300.0, 10.0]
+
+        def remaining(self):
+            return self.values.pop(0) if len(self.values) > 1 else self.values[0]
+
+        def timeout(self, value, **kwargs):
+            return value
+
+    limits = RetrievalLimits(screen_batch=1)
+    client = FakeClient(['{"papers":[{"filename":"first.pdf"}]}'])
+    kept = _screen(client, "adaptive decoding", "", ranked, "adaptive decoding", limits, Clock(), settings, "B-01")
+    assert len(client.calls) == 1
+    assert kept == {"first.pdf", "second.pdf"}

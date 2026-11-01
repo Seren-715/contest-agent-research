@@ -28,7 +28,9 @@ def mount(tmp_path, monkeypatch):
 def test_filename_differing_only_in_case_resolves_to_the_actual_file(mount):
     data, root = mount
     actual = _pdf(root / "论文库" / "Adaptive_Decoding.pdf")
-    assert resolve_materials(["adaptive_decoding.PDF"], data) == [actual]
+    resolved = resolve_materials(["adaptive_decoding.PDF"], data)
+    assert [path.name for path in resolved] == ["Adaptive_Decoding.pdf"]
+    assert resolved[0].samefile(actual)
 
 
 def test_filename_in_another_unicode_normal_form_resolves(mount):
@@ -45,12 +47,31 @@ def test_prose_scope_without_scope_words_is_a_description_only_when_allowed(moun
         resolve_materials(["论文库中的全部论文"], data)
 
 
-def test_library_of_symlinks_into_a_shared_store_is_readable_under_its_library_name(mount, tmp_path):
+def _symlink(link, target):
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:  # e.g. Windows without symlink privilege
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+
+def test_symlink_leaving_the_data_roots_is_rejected_or_skipped(mount, tmp_path):
     data, root = mount
-    target = _pdf(tmp_path / "shared-store" / "blob-123.pdf")
-    link = root / "论文库" / "Adaptive_Decoding.pdf"
-    link.parent.mkdir(parents=True)
-    link.symlink_to(target)
+    outside = _pdf(tmp_path / "outside-store" / "secret.pdf")
+    inside = _pdf(root / "论文库" / "a.pdf")
+    _symlink(root / "论文库" / "escape.pdf", outside)
+    with pytest.raises(MaterialResolutionError, match="outside allowed data roots"):
+        resolve_materials(["escape.pdf"], data)
+    with pytest.raises(MaterialResolutionError, match="outside allowed data roots"):
+        resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True)
+    # Retrieval over the whole library skips the escaping link and keeps the rest.
+    assert resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True, lenient=True) == [inside]
+
+
+def test_symlink_within_the_data_roots_is_read_under_its_library_name(mount):
+    data, root = mount
+    target = _pdf(root / "store" / "blob-123.pdf")
+    _symlink(root / "论文库" / "Adaptive_Decoding.pdf", target)
     resolved = resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True)
     assert [path.name for path in resolved] == ["Adaptive_Decoding.pdf"]
     assert resolve_materials(["Adaptive_Decoding.pdf"], data)[0].name == "Adaptive_Decoding.pdf"
@@ -106,3 +127,11 @@ def test_b_case_with_a_case_differing_material_reaches_the_model(settings, monke
                                "input": "adaptive decoding", "materials": ["adaptive_decoding.pdf"]}, settings)
     assert len(client.calls) == 1
     assert [item["filename"] for item in result["papers"]] == ["Adaptive_Decoding.pdf"]
+
+
+def test_on_disk_case_reports_the_stored_name(tmp_path):
+    from core.paperlib import _on_disk_case
+    stored = _pdf(tmp_path / "Adaptive_Decoding.pdf")
+    assert _on_disk_case(tmp_path / "adaptive_decoding.PDF") == stored
+    assert _on_disk_case(tmp_path / "Adaptive_Decoding.pdf") == stored
+    assert _on_disk_case(tmp_path / "missing.pdf") == tmp_path / "missing.pdf"

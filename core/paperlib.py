@@ -588,6 +588,19 @@ def _lexical(path: Path) -> Path:
     return Path(os.path.abspath(str(path)))
 
 
+def _on_disk_case(path: Path) -> Path:
+    """On case-insensitive file systems a path "exists" in any letter case;
+    report the file name exactly as the directory stores it."""
+    try:
+        names = os.listdir(path.parent)
+    except OSError:
+        return path
+    if path.name in names:
+        return path
+    matches = [name for name in names if _fold_name(name) == _fold_name(path.name)]
+    return path.parent / matches[0] if len(matches) == 1 else path
+
+
 def _fold_name(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
@@ -637,17 +650,20 @@ def resolve_materials(
         data_bases.append(Path(os.environ["DATA_PATH"]))
     allowed = list(dict.fromkeys([_lexical(base) for base in data_bases] + [base.resolve() for base in data_bases]))
 
+    resolved_bases = list(dict.fromkeys(base.resolve() for base in data_bases))
+
     def within(path: Path) -> bool:
-        # A library may be a directory of symlinks into a shared store; the
-        # declared (lexical) location is what must lie inside the data mount.
-        # Parent traversal is rejected separately, so this cannot escape it.
-        return any(candidate == base or base in candidate.parents
-                   for candidate in (_lexical(path), path.resolve()) for base in allowed)
+        # Both the declared location and the real target (after symlinks) must
+        # lie inside a data root: the spec forbids symlinks that leave it.
+        lexical, resolved = _lexical(path), path.resolve()
+        return (any(lexical == base or base in lexical.parents for base in allowed)
+                and any(resolved == base or base in resolved.parents for base in resolved_bases))
 
     def checked(path: Path) -> Path:
         if not within(path):
             raise MaterialResolutionError(f"material outside allowed data roots: {path.name}")
-        return _lexical(path)
+        # Keep the library's own (link) name, spelled as it is on disk.
+        return _on_disk_case(_lexical(path))
 
     folded_index: dict[str, list[Path]] = {}
 
@@ -664,7 +680,8 @@ def resolve_materials(
                         if value.is_file():
                             folded_index.setdefault(_fold_name(value.name), []).append(value)
             folded_index.setdefault("", [])
-        return [checked(value) for value in folded_index.get(_fold_name(name), [])]
+        # A same-named file whose real target leaves the data roots is not a match.
+        return [checked(value) for value in folded_index.get(_fold_name(name), []) if within(value)]
 
     def folded_path_matches(path: Path) -> list[Path]:
         # A declared directory part is part of the identity: compare the whole
@@ -686,7 +703,13 @@ def resolve_materials(
                 declared.extend(list_pdfs(directory))
             if declared:
                 logging.getLogger(__name__).warning("material_library_fallback pdfs=%d", len(declared))
-        return [checked(path) for path in declared]
+        result: list[Path] = []
+        for path in declared:
+            if lenient and not within(path):
+                skipped.append("outside_roots")
+                continue
+            result.append(checked(path))
+        return result
 
     def identical_pdf_scopes(directories: list[Path]) -> bool:
         if not directories or any(not directory.is_dir() for directory in directories):

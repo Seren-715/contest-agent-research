@@ -192,8 +192,9 @@ def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[Mate
 
     Sequential detailed batches over 100+ papers do not fit the B time budget,
     so lexical rank would decide which papers the model never sees. Here every
-    paper is seen once. Papers of a failed screen batch pass through to the
-    detailed stage. Returns None only if every screen batch failed.
+    paper is seen once. Papers of a failed or (for lack of time) unscreened
+    batch pass through to the detailed stage. Returns None only if no screen
+    batch succeeded.
     """
     kept: set[str] = set()
     succeeded = 0
@@ -202,7 +203,11 @@ def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[Mate
         batch = ranked[offset:offset + limits.screen_batch]
         names = {record.filename.casefold() for record, _ in batch}
         if deadline.remaining() < 60:
-            LOGGER.warning("B screen stopped at deadline after %d papers", offset)
+            # Unscreened papers were never judged: pass them all through, like
+            # a failed batch, rather than dropping them.
+            rest = {record.filename.casefold() for record, _ in ranked[offset:]}
+            kept |= rest
+            LOGGER.warning("B screen stopped at deadline after %d papers; passing %d through", offset, len(rest))
             break
         listing = "\n".join(
             f"{index}. {record.filename}\n" + " ".join(evidence_excerpt(
