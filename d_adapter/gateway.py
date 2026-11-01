@@ -35,59 +35,26 @@ class GeneratedSource:
 # Keep the distinction: telling the model to write 3.11-only code would make the
 # generated implementation fail in the platform executor.
 PROMPT_HEADER = (
-    "请根据以下公开方法和协议，自行实现完整的、兼容 Python 3.9 的标准库算法"
+    "请根据下面本轮提供的任务材料，自行实现完整的、兼容 Python 3.9 的标准库算法"
     "（平台算法容器固定为 Python 3.9；不要使用 3.10+ 才有的语法或标准库特性）。"
-    "定义 run_experiment(request)，不得联网、不得打印日志、不得读取隐藏标签。"
-    "只返回一个完整的 ```python 代码块，不要省略函数、不要返回补丁、不要拆分成多段。"
-    "返回算法内部结构（baseline/candidate/details），不要返回 case_id/status/metrics/figures "
-    "或自算指标。实现必须确定、单进程、只使用标准库，并严格遵守 protocol.json 的 response_schema。"
-    "不要输出长篇思考过程；最终只返回一个完整的 ```python 代码块。"
+    "定义 run_experiment(request)，不得联网、不得打印日志、不得读取隐藏标签或材料以外的文件。"
+    "必须实现材料指定的方法、参数和步骤；换用其他算法即使指标更好也不算复现。"
+    "正式任务可能与任何练习题不同：方法、参数、字段和返回结构只以下面的当轮材料为准。"
+    "run_experiment 返回的是算法内部结果对象，按 protocol.json 规定的返回字段、类型和嵌套结构给出；"
+    "它不是最终 Reproduction 答卷，不要返回 case_id/status/metrics/figures 或自算指标。"
+    "材料中的字段和类型模板只说明格式，占位值不能作为实际结果。"
+    "实现必须确定、单进程、只使用标准库。"
+    "只返回一个完整的 ```python 代码块，不要省略函数、不要返回补丁、不要拆分成多段，"
+    "不要输出长篇思考过程。"
 )
 
-CASE_SKELETON = {
-    "D-01": (
-        '{"baseline":["label",...],"candidate":["label",...],'
-        '"details":{"classes":["..."],"vocabulary":["..."],"idf":[...],'
-        '"weights":[[...]]}}'
-    ),
-    "D-02": (
-        'run: {"baseline":{"qid":[{"id":"...","score":1.0}]},"candidate":{...},'
-        '"details":{"selected":{"k1":...,"b":...,"title_weight":...},'
-        '"search":[{"config":{...},"rankings":{"qid":[{"id":"...","score":1.0}]},'
-        '"recall_at_5_percent":...,"mrr_at_10":...,'
-        '"group_metrics":{"groups":{...},"worst_mrr_at_10":...,'
-        '"macro_mrr_at_10":...,"macro_recall_at_5_percent":...}}]}}; '
-        'rank: {"candidate":{"qid":[{"id":"...","score":1.0}]}}'
-    ),
-    "D-05": (
-        '{"baseline":{"trace":[{"id":"...","flow":"...","arrival_ms":...,'
-        '"service_ms":...,"deadline_ms":...,"server":0,"dispatch_ms":...,'
-        '"setup_ms":...,"start_ms":...,"end_ms":...,"wait_ms":...}],'
-        '"served_ms":{"flow":0},"dropped":[{"id":"...","reason":"deadline"}]},'
-        '"candidate":{...},"details":{}}'
-    ),
-}
-
-CASE_CHECKLIST = {
-    "D-01": (
-        "自测会检查：baseline/candidate 与 data.texts 对齐；candidate 非 null；"
-        "details 直接包含 classes/vocabulary/idf/weights；classes/vocabulary 字典序；"
-        "weights 为 类别数×(词表大小+1)，最后一列 bias；空文本保留 bias；无 NaN/Inf；"
-        "允许数值等价，但训练方法、特征构造、类别顺序和并列规则必须符合 method.md。"
-    ),
-    "D-02": (
-        "自测会检查：baseline/candidate 覆盖全部 test 文档；details.selected 含 k1/b/title_weight；"
-        "details.search 恰好 27 行；每行含 config/rankings/recall_at_5_percent/mrr_at_10/group_metrics；"
-        "dev rankings 覆盖全部文档；N 含空字段文档；avg_len=0 取 1；重复查询词重复计分；"
-        "rank 阶段只用 data.selected，不重新选参。"
-    ),
-    "D-05": (
-        "自测会检查：baseline 为 FIFO、candidate 为加权公平；每个任务恰好出现在 trace 或 dropped 一次；"
-        "served_ms 覆盖 flow_weights 全部流；trace 含 server/dispatch_ms/setup_ms/start_ms/end_ms/wait_ms；"
-        "start=dispatch+setup，end=start+service，wait=start-arrival；start<deadline，end<=horizon；"
-        "dropped 按 id 排序；拒绝任务不回队、不改变上一流；派发即累计已分配服务量。"
-    ),
-}
+# Files read from the round's case directory, in this order. Other text
+# material in that directory is appended generically (never by case number).
+PRIMARY_MATERIALS = ("method.md", "protocol.json", "sample.json")
+# Execution adapters and integrity metadata: not task material for the model.
+NON_TASK_FILES = {"worker.py", "artifacts.py", "font.py", "experiment.py", "manifest.json"}
+EXTRA_SUFFIXES = {".md", ".txt", ".json", ".py", ".csv"}
+EXTRA_MATERIAL_CHARS = 40000
 
 
 def _read(path: Path) -> str:
@@ -142,21 +109,30 @@ def _complete_raw(client: ModelClient, messages: list[dict[str, str]], max_token
 
 
 def build_prompt(case_id: str, task_input: str, materials_dir: Path) -> str:
-    method = _read(materials_dir / "method.md")
-    protocol = _read(materials_dir / "protocol.json")
-    sample = _read(materials_dir / "sample.json")
-    return "\n\n".join(
-        [
-            PROMPT_HEADER,
-            f"【题目输入】\n{task_input}",
-            f"【method.md】\n{method}",
-            f"【protocol.json】\n{protocol}",
-            f"【sample.json】\n{sample}",
-            f"【case_id】{case_id}",
-            "【自测会检查】\n" + CASE_CHECKLIST.get(case_id, ""),
-            "【返回结构骨架】\n" + CASE_SKELETON.get(case_id, ""),
-        ]
-    )
+    """Generic prompt from the round's materials only (D rules update:
+    no task-specific hints, skeletons or checklists in the image)."""
+    parts = [PROMPT_HEADER, f"【题目输入】\n{task_input}"]
+    for name in PRIMARY_MATERIALS:
+        path = materials_dir / name
+        if path.is_file():
+            parts.append(f"【{name}】\n{_read(path)}")
+    budget = EXTRA_MATERIAL_CHARS
+    for path in sorted(materials_dir.iterdir()) if materials_dir.is_dir() else []:
+        if (not path.is_file() or path.name in PRIMARY_MATERIALS or path.name in NON_TASK_FILES
+                or path.suffix.lower() not in EXTRA_SUFFIXES):
+            continue
+        try:
+            text = _read(path)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if len(text) > budget:
+            continue
+        budget -= len(text)
+        parts.append(f"【{path.name}】\n{text}")
+    if len(parts) == 2:
+        raise GenerationError(f"no task material found in {materials_dir}")
+    parts.append(f"【case_id】{case_id}")
+    return "\n\n".join(parts)
 
 
 def generate(

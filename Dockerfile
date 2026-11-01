@@ -27,9 +27,8 @@ COPY --chown=agent:agent core /app/core
 COPY --chown=agent:agent handlers /app/handlers
 COPY --chown=agent:agent d_adapter /app/d_adapter
 
-# Public sample requests are teaching material (no answers). Bake them in so
-# the self-test/repair loop works even if the platform mounts only case dirs.
-COPY --chown=agent:agent vendor/d-class/公开样例请求 /app/d-class-samples/公开样例请求
+# No practice-task samples in the image: formal D tasks may differ from them
+# (D rules update). The self-test uses the round's own mounted sample.json.
 
 # The platform injects gateway credentials at runtime. This optional local
 # config must contain empty URL/key fields in the submission image.

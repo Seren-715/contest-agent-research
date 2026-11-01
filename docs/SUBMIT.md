@@ -60,10 +60,10 @@ LABEL org.agenthack.version=1.5.1
 
 ```bash
 docker run --rm --platform linux/amd64 --entrypoint /bin/sh contest-agent:1.5.0 -c \
-  'id; python --version; curl --version | head -1; ls /app; ls /app/d-class-samples/公开样例请求 | head'
+  'id; python --version; curl --version | head -1; ls /app'
 ```
 
-应看到 `uid=1000(agent)`、Python 3.11、curl、`agent.py`、五类目录、公开样例。
+应看到 `uid=1000(agent)`、Python 3.11、curl、`agent.py`、五类目录。按 2026-11-01 D 类更新通知，镜像不再内置练习题样例（`/app/d-class-samples` 不应存在）。
 
 ## 4. 本地冒烟
 

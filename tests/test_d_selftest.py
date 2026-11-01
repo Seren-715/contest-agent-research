@@ -11,10 +11,11 @@ import core.solve as solve_module
 from d_adapter import selftest
 
 
+# Fails on the current round's sample request with a real exception: the only
+# kind of failure a generic (task-agnostic) self-test may judge.
 BAD_SOURCE = """
 def run_experiment(request):
-    n = len(request["data"]["texts"])
-    return {"baseline": ["x"] * n, "candidate": None, "details": {}}
+    return {"baseline": request["data"]["field_this_task_does_not_have"]}
 """
 
 GOOD_SOURCE = """
@@ -135,12 +136,78 @@ def test_pipeline_repairs_failed_selftest(tmp_path, settings, monkeypatch) -> No
     assert report["ok"] is True
 
 
-def test_d01_validator_rejects_null_candidate() -> None:
+def test_validation_is_generic_and_never_judges_task_semantics() -> None:
+    # Notice (D rules update): no task-specific semantic validators in the image.
     request = {"data": {"train": [{"text": "a b", "label": "x"}], "texts": ["a"]}}
-    result = {"baseline": ["x"], "candidate": None, "details": {}}
-    errors = selftest.validate("D-01", "run", request, result)
-    assert errors
-    assert "candidate" in errors[0]
+    semantically_dubious = {"baseline": ["x"], "candidate": None, "details": {}}
+    for case_id in ("D-01", "D-02", "D-05", "D-09"):
+        assert selftest.validate(case_id, "run", request, semantically_dubious) == []
+        assert selftest.validate(case_id, "run", request, {}) != []
+        assert selftest.validate(case_id, "run", request, ["not", "an", "object"]) != []
+    assert not [name for name in dir(selftest) if name.startswith("_validate_d0")]
+
+
+def _case_dir(tmp_path, protocol=None):
+    root = Path(__file__).resolve().parents[1] / "vendor" / "d-class"
+    if not (root / "D-01" / "worker.py").exists():
+        pytest.skip("vendor/d-class is not present")
+    case = tmp_path / "experiments" / "D-01"
+    case.mkdir(parents=True)
+    for name in ("worker.py", "artifacts.py", "font.py", "protocol.json", "sample.json", "method.md"):
+        (case / name).write_bytes((root / "D-01" / name).read_bytes())
+    if protocol is not None:
+        (case / "protocol.json").write_text(json.dumps(protocol, ensure_ascii=False), encoding="utf-8")
+    return case
+
+
+def test_prompt_is_built_from_the_round_materials_only(tmp_path) -> None:
+    from d_adapter import gateway
+    case = tmp_path / "D-01"
+    case.mkdir()
+    (case / "method.md").write_text("ROUND-METHOD: implement method Q.", encoding="utf-8")
+    (case / "protocol.json").write_text('{"return": "ROUND-SCHEMA"}', encoding="utf-8")
+    (case / "sample.json").write_text('{"case_id": "D-01", "phase": "run", "data": {}}', encoding="utf-8")
+    (case / "notes.md").write_text("ROUND-EXTRA material", encoding="utf-8")
+    prompt = gateway.build_prompt("D-01", "TASK-INPUT", case)
+    for marker in ("ROUND-METHOD", "ROUND-SCHEMA", "TASK-INPUT", "ROUND-EXTRA"):
+        assert marker in prompt
+    # Nothing depends on the case number except the case number itself.
+    other = gateway.build_prompt("D-05", "TASK-INPUT", case)
+    assert other.rsplit("【case_id】", 1)[0] == prompt.rsplit("【case_id】", 1)[0]
+    assert not hasattr(gateway, "CASE_CHECKLIST") and not hasattr(gateway, "CASE_SKELETON")
+    for practice_hint in ("FIFO", "k1", "title_weight", "27 行", "加权公平", "baseline/candidate/details"):
+        assert practice_hint not in gateway.PROMPT_HEADER
+
+
+def test_selftest_runs_the_rounds_own_sample_request(tmp_path, settings) -> None:
+    from core.budget import Deadline
+    case = _case_dir(tmp_path)
+    settings = dataclasses.replace(settings, d_materials_root=case.parent, d_samples_root=None,
+                                   d_selftest_timeout=10.0, d_formal_reserve=1.0)
+    implementation = tmp_path / "impl.py"
+    implementation.write_text("def run_experiment(request):\n    return {'echo': sorted(request)}\n", encoding="utf-8")
+    report = selftest.run_selftest("D-01", implementation, settings, tmp_path / "work", Deadline(60))
+    assert report.ok and not report.skipped
+    assert [sample.name for sample in report.samples] == ["sample"]
+    bad = tmp_path / "bad.py"
+    bad.write_text(BAD_SOURCE, encoding="utf-8")
+    report = selftest.run_selftest("D-01", bad, settings, tmp_path / "work2", Deadline(60))
+    assert not report.ok and "field_this_task_does_not_have" in report.error_text()
+
+
+def test_samples_written_for_another_protocol_are_skipped(tmp_path, settings) -> None:
+    from core.budget import Deadline
+    root = Path(__file__).resolve().parents[1] / "vendor" / "d-class"
+    protocol = json.loads((root / "D-01" / "protocol.json").read_text(encoding="utf-8"))
+    protocol["learning_rate"] = 0.123  # the formal round changed a parameter
+    case = _case_dir(tmp_path, protocol=protocol)
+    settings = dataclasses.replace(settings, d_materials_root=case.parent, d_samples_root=root / "公开样例请求",
+                                   d_selftest_timeout=10.0, d_formal_reserve=1.0)
+    implementation = tmp_path / "impl.py"
+    implementation.write_text("def run_experiment(request):\n    return {'ok': True}\n", encoding="utf-8")
+    report = selftest.run_selftest("D-01", implementation, settings, tmp_path / "work", Deadline(60),
+                                   max_samples=10)
+    assert [sample.name for sample in report.samples] == ["sample"]  # practice requests are stale
 
 
 def test_pipeline_regenerates_truncated_source(tmp_path, settings, monkeypatch) -> None:
