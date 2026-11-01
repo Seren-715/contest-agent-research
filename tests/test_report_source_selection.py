@@ -179,13 +179,14 @@ def test_selection_shows_every_paper_with_its_folder_and_the_task_title(settings
     assert "电动汽车电池回收" in prompt and "通常指定 5 篇" in prompt
 
 
-def test_selection_keeps_at_most_two_more_than_the_designated_count(settings, tmp_path, monkeypatch):
+def test_selection_is_never_trimmed_even_against_an_incomplete_count(settings, tmp_path, monkeypatch):
     records = _library(tmp_path, monkeypatch, designated=10)
     picked = [r.path for r in records if r.filename.startswith("z")]
-    paths = select_report_materials({"case_id": "C-01", "input": "综述，至少 5 篇指定论文",
-                                     "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
-                                    settings, FakeClient([choice(picked)]), Deadline(900))
-    assert paths == picked[:7]
+    for task in ("综述，至少 5 篇指定论文", "Use at least 5 papers and at least 10 peer-reviewed papers"):
+        paths = select_report_materials({"case_id": "C-01", "input": task,
+                                         "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
+                                        settings, FakeClient([choice(picked)]), Deadline(900))
+        assert paths == picked
 
 
 @pytest.mark.parametrize("question,expected", [
@@ -198,6 +199,7 @@ def test_selection_keeps_at_most_two_more_than_the_designated_count(settings, tm
     ({"input": "至少两篇"}, 2),
     ({"input": "至少 5 篇", "constraints": ["至少引用十篇指定论文"]}, 10),
     ({"input": "Cite at least 8 papers"}, 8),
+    ({"input": "Use at least 5 papers and at least 10 peer-reviewed papers"}, 10),
 ])
 def test_required_count_is_read_from_the_task(question, expected):
     from core.materials import _required_count

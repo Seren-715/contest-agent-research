@@ -45,10 +45,10 @@ def _cn_number(text: str) -> int | None:
 
 
 def _required_count(question: dict[str, Any]) -> int | None:
-    """Papers the task explicitly requires ("至少十篇", "5 篇指定论文"), else None.
+    """Best-effort count the task states ("至少十篇", "5 篇指定论文"), else None.
 
-    Reads title, input, constraints and expected_output. The largest stated
-    count wins so that a requirement is never under-counted.
+    Reads title, input, constraints and expected_output; the largest match
+    wins. Used only as a hint in the selection prompt, never to cut results.
     """
     fields = [question.get(key) for key in ("title", "input", "expected_output")]
     constraints = question.get("constraints")
@@ -57,7 +57,8 @@ def _required_count(question: dict[str, Any]) -> int | None:
     number = r"(\d+|[零一二两三四五六七八九十]{1,3})"
     counts = []
     for pattern in (r"至少\s*" + number + r"\s*篇", number + r"\s*篇\s*(?:指定|实际引用的|相关)?\s*(?:论文|文献|材料|PDF)",
-                    r"at\s+least\s+(\d+)\s+(?:papers?|sources?)", r"(\d+)\s+(?:designated|specified)\s+papers?"):
+                    r"at\s+least\s+(\d+)\s+(?:[\w-]+\s+){0,3}?(?:papers?|sources?|articles?|studies)",
+                    r"(\d+)\s+(?:designated|specified)\s+papers?"):
         for match in re.finditer(pattern, text, re.IGNORECASE):
             value = _cn_number(match.group(1))
             if value is not None and 1 <= value <= 50:
@@ -158,13 +159,9 @@ def select_report_materials(
             name, reason = hit.get("filename"), hit.get("reason")
             if isinstance(name, str) and name in allowed and isinstance(reason, str) and len(reason.strip()) >= 8:
                 selected.setdefault(name, {"filename": name, "reason": reason.strip(), "sha256": by_name[name].sha256})
-    # Trim only against an explicitly stated count; an unparsed requirement
-    # must never cut papers the model selected.
-    limit = stated + 2 if stated else None
-    if limit is not None and len(selected) > limit:
-        logging.getLogger(__name__).warning("report_selection_trimmed case_id=%s selected=%d kept=%d",
-                                            case_id, len(selected), limit)
-        selected = dict(list(selected.items())[:limit])
+    # No trimming: a parsed count can be incomplete ("at least 5 ... and at
+    # least 10 ..."), and cutting would drop papers the task requires. The
+    # count only informs the prompt.
     if not selected:
         raise HandlerError("no source matched the described report scope")
     # This is a selection receipt, not a claim that model relevance is gold.

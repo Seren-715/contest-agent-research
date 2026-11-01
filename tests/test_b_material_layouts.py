@@ -39,12 +39,18 @@ def test_filename_in_another_unicode_normal_form_resolves(mount):
     assert resolve_materials([unicodedata.normalize("NFC", "Café.pdf")], data) == [actual]
 
 
-def test_prose_scope_without_scope_words_is_a_description_only_when_allowed(mount):
+@pytest.mark.parametrize("entry", ["论文库中的全部论文", "2024论文资料", "important_folder"])
+def test_missing_entry_is_never_reinterpreted_as_a_library_description(mount, entry):
     data, root = mount
     paper = _pdf(root / "论文库" / "a.pdf")
-    assert resolve_materials(["论文库中的全部论文"], data, allow_descriptions=True) == [paper]
-    with pytest.raises(MaterialResolutionError, match="not found"):
-        resolve_materials(["论文库中的全部论文"], data)
+    _pdf(root / "论文库" / "other.pdf")
+    for kwargs in ({}, {"allow_descriptions": True}):
+        with pytest.raises(MaterialResolutionError, match="not found"):
+            resolve_materials([entry], data, **kwargs)
+    # Retrieval skips it; it never widens to the rest of the library.
+    with pytest.raises(MaterialResolutionError, match="could be resolved"):
+        resolve_materials([entry], data, allow_descriptions=True, lenient=True)
+    assert resolve_materials([entry, "a.pdf"], data, allow_descriptions=True, lenient=True) == [paper]
 
 
 def _symlink(link, target):
@@ -135,25 +141,6 @@ def test_on_disk_case_reports_the_stored_name(tmp_path):
     assert _on_disk_case(tmp_path / "adaptive_decoding.PDF") == stored
     assert _on_disk_case(tmp_path / "Adaptive_Decoding.pdf") == stored
     assert _on_disk_case(tmp_path / "missing.pdf") == tmp_path / "missing.pdf"
-
-
-def test_missing_identifier_is_not_reinterpreted_as_a_library_description(mount):
-    data, root = mount
-    _pdf(root / "论文库" / "a.pdf")
-    for kwargs in ({}, {"allow_descriptions": True}):
-        with pytest.raises(MaterialResolutionError, match="not found"):
-            resolve_materials(["important_folder"], data, **kwargs)
-    with pytest.raises(MaterialResolutionError, match="could be resolved"):
-        resolve_materials(["important_folder"], data, allow_descriptions=True, lenient=True)
-
-
-@pytest.mark.parametrize("text,expected", [
-    ("论文库中的全部论文", True), ("all local papers", True), ("important_folder", False),
-    ("papers_2024", False), ("目录", False),
-])
-def test_prose_scope_detection(text, expected):
-    from core.paperlib import _looks_like_prose_scope
-    assert _looks_like_prose_scope(text) is expected
 
 
 def test_lenient_explicit_materials_skip_an_escaping_link_and_keep_the_rest(mount, tmp_path):

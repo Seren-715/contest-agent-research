@@ -590,14 +590,6 @@ def _lexical(path: Path) -> Path:
     return Path(os.path.abspath(str(path)))
 
 
-def _looks_like_prose_scope(text: str) -> bool:
-    """A sentence about papers (CJK or spaced words), not a bare identifier."""
-    value = text.strip()
-    mentions_papers = re.search(r"论文|文献|pdf|papers?\b|literature", value, re.IGNORECASE)
-    sentence_like = re.search(r"[\u4e00-\u9fff]", value) or re.search(r"\s", value)
-    return bool(mentions_papers and sentence_like)
-
-
 def _on_disk_case(path: Path) -> Path:
     """On case-insensitive file systems a path "exists" in any letter case;
     report the file name exactly as the directory stores it."""
@@ -798,13 +790,9 @@ def resolve_materials(
                 found = list(dict.fromkeys(folded_path_matches(path)))
                 if found:
                     logging.getLogger(__name__).warning("material_name_folded matches=%d", len(found))
-            if (not found and allow_descriptions and len(path.parts) == 1 and not path.suffix
-                    and _looks_like_prose_scope(item)):
-                # Not a path and nothing by that name exists, and it reads as a
-                # sentence about papers, e.g. "论文库中的全部论文". A missing
-                # identifier such as "important_folder" stays an error.
-                descriptions.append(item)
-                continue
+            # A missing entry is never reinterpreted as a library description:
+            # keywords cannot tell "2024论文资料" (a folder) from prose, and
+            # guessing would widen the scope to the whole library.
             if not found:
                 if lenient:
                     skipped.append("not_found")
