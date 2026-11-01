@@ -7,7 +7,7 @@ import pytest
 
 from core.paperlib import EvidencePassage, MaterialRecord
 from core.schemas import validate_answer
-from handlers.b_retrieval import RetrievalHandler, _rank_records
+from handlers.b_retrieval import RetrievalHandler
 from handlers.base import HandlerError
 from scripts.evaluate_retrieval import evaluate, evaluate_case
 from tests.conftest import FakeClient
@@ -21,7 +21,8 @@ def _corpus(monkeypatch, tmp_path, count=26, body="Adaptive decoding for languag
     records = [MaterialRecord(path=p, filename=p.name, sha256="test", bytes=6, pages=1,
                               title="Language inference", abstract=body, text=body) for p in paths]
     monkeypatch.setattr("handlers.b_retrieval.resolve_materials", lambda *a, **kw: paths)
-    monkeypatch.setattr("handlers.b_retrieval.index_materials", lambda actual, **kwargs: records)
+    monkeypatch.setattr("handlers.b_retrieval.index_materials",
+                        lambda actual, **kwargs: [r for r in records if r.path in set(actual)])
     return paths
 
 
@@ -40,7 +41,7 @@ def test_all_files_after_twentieth_and_more_than_five_results(settings, tmp_path
     client = SelectEachBatch()
     result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
     assert {item["filename"] for item in result["papers"]} == {p.name for p in paths}
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1  # one selection call judges every candidate together
     validate_answer("Literature_Retrieval", result)
 
 
@@ -79,41 +80,6 @@ def test_failed_model_with_exclusion_never_guesses_from_overlap(settings, tmp_pa
         RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding excluding language inference"}, settings, FakeClient(["bad JSON"]))
 
 
-def test_candidate_budget_is_configurable_and_visible(settings, tmp_path, monkeypatch, caplog):
-    _corpus(monkeypatch, tmp_path, count=5)
-    monkeypatch.setenv("CONTEST_B_CANDIDATES", "3")
-    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding"}, settings, SelectEachBatch())
-    assert len(result["papers"]) == 3
-    assert "evaluating 3 of 5 papers" in caplog.text
-
-
-def test_many_chunks_of_same_paper_do_not_displace_other_papers(tmp_path):
-    def record(name, count):
-        text = "adaptive decoding language inference"
-        return MaterialRecord(path=tmp_path / name, filename=name, sha256="test", bytes=5,
-                              pages=count, title=name, abstract=text, text=text,
-                              passages=tuple(EvidencePassage(i + 1, 0, len(text), text) for i in range(count)))
-    records = [record("a.pdf", 50), record("b.pdf", 1), record("c.pdf", 1)]
-    ranked = _rank_records("adaptive decoding", records)
-    assert len(ranked) == 3
-    assert len({item.filename for item, _ in ranked}) == 3
-    assert all(score > 0 for _, score in ranked)
-
-
-def test_failed_later_batch_keeps_already_selected_results(settings, tmp_path, monkeypatch):
-    _corpus(monkeypatch, tmp_path, count=3)
-    monkeypatch.setenv("CONTEST_B_BATCH_SIZE", "2")
-
-    class FailsLater(SelectEachBatch):
-        def complete(self, messages, **kwargs):
-            if self.calls:
-                raise RuntimeError("upstream unavailable")
-            return super().complete(messages, **kwargs)
-
-    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding", "constraints": ["必须符合检索条件"]}, settings, FailsLater())
-    assert len(result["papers"]) == 2
-
-
 def test_real_pdf_after_twentieth_with_unique_middle_page_evidence(settings):
     from fpdf import FPDF
 
@@ -137,8 +103,7 @@ def test_real_pdf_after_twentieth_with_unique_middle_page_evidence(settings):
         def complete(self, messages, **kwargs):
             prompt = messages[-1]["content"]
             if "z_relevant.pdf" in prompt:
-                assert "QuarrySpec" in prompt
-                assert "p.10" in prompt
+                assert "QuarrySpec" in prompt  # the middle page reached the prompt
                 return json.dumps({"papers": [{"filename": "z_relevant.pdf", "reason": "中间页原文描述自适应解码及推理吞吐量。"}]}, ensure_ascii=False)
             return '{"papers":[]}'
 
@@ -264,19 +229,6 @@ def test_returned_name_is_matched_case_insensitively_and_emitted_canonically(set
     assert [item["filename"] for item in result["papers"]] == ["paper_00.pdf"]
 
 
-def test_translated_keywords_rank_independently_of_the_cjk_query():
-    from handlers.b_retrieval import _rank_records
-
-    def make(name, body):
-        return MaterialRecord(path=Path(name), filename=name, sha256="t", bytes=1, pages=1,
-                              title=name, abstract=body, text=body)
-
-    relevant = make("english.pdf", "adaptive decoding for language inference throughput")
-    other = make("other.pdf", "botany observations")
-    ranked = _rank_records("自适应解码", [other, relevant], ("adaptive", "decoding"))
-    assert ranked[0][0].filename == "english.pdf" and ranked[0][1] > 0
-
-
 @pytest.mark.parametrize("query", [
     "adaptive decoding language inference published after 2022",
     "adaptive decoding language inference, only on English benchmarks",
@@ -291,175 +243,46 @@ def test_lexical_fallback_is_refused_when_the_query_states_a_condition(settings,
         RetrievalHandler().handle({"case_id": "B-01", "input": query}, settings, FakeClient(["bad JSON"]))
 
 
-class ScreenThenVerify:
-    """Screen keeps paper_x7 files; verify accepts everything it is shown."""
-
-    def __init__(self, fail_screen_batches=()):
-        self.screen_calls = []
-        self.verify_calls = []
-        self.fail_screen_batches = set(fail_screen_batches)
-
-    def complete(self, messages, **kwargs):
-        prompt = messages[-1]["content"]
-        if "宽松初筛" in prompt:
-            names = re.findall(r"^\d+\. (paper_\d+\.pdf)$", prompt, re.MULTILINE)
-            self.screen_calls.append(names)
-            if len(self.screen_calls) - 1 in self.fail_screen_batches:
-                raise RuntimeError("upstream unavailable")
-            return json.dumps({"papers": [{"filename": n} for n in names if n.endswith("7.pdf")]})
-        names = re.findall(r"\d+\. (paper_\d+\.pdf)（", prompt)
-        self.verify_calls.append(names)
-        return json.dumps({"papers": [{"filename": n, "reason": "正文研究自适应解码与语言推理吞吐量。"} for n in names]},
-                          ensure_ascii=False)
+def test_shortlist_size_is_configurable_and_visible(settings, tmp_path, monkeypatch, caplog):
+    _corpus(monkeypatch, tmp_path, count=5)
+    monkeypatch.setenv("CONTEST_B_SHORTLIST", "3")
+    client = SelectEachBatch()
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding"}, settings, client)
+    assert len(result["papers"]) == 3
+    assert "deep-reading 3 of 5 scanned papers" in caplog.text
 
 
-def _large_corpus(monkeypatch, tmp_path, count=130):
-    paths = [tmp_path / ("paper_%03d.pdf" % index) for index in range(count)]
-    for path in paths:
-        path.write_bytes(b"%PDF-")
-    body = "Adaptive decoding for language inference throughput"
-    records = [MaterialRecord(path=p, filename=p.name, sha256="t", bytes=6, pages=1,
-                              title="Language inference", abstract=body, text=body) for p in paths]
-    monkeypatch.setattr("handlers.b_retrieval.resolve_materials", lambda *a, **kw: paths)
-    monkeypatch.setattr("handlers.b_retrieval.index_materials", lambda actual, **kwargs: records)
-    return paths
+def test_every_paper_is_scanned_before_the_shortlist(settings, tmp_path, monkeypatch):
+    paths = _corpus(monkeypatch, tmp_path, count=130)
+    seen = []
+    original = __import__("handlers.b_retrieval", fromlist=["x"]).index_materials
+
+    def spy(actual, **kwargs):
+        seen.append(list(actual))
+        return original(actual, **kwargs)
+
+    monkeypatch.setattr("handlers.b_retrieval.index_materials", spy)
+    RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding"}, settings, SelectEachBatch())
+    assert seen[0] == paths            # first pages of all 130 papers
+    assert len(seen[1]) == 60          # default shortlist read deeply
 
 
-def test_large_library_is_screened_once_per_paper_then_verified(settings, tmp_path, monkeypatch):
-    import dataclasses
-    settings = dataclasses.replace(settings, case_budget=540.0)  # B's real limit; 180 s leaves no screen time
-    paths = _large_corpus(monkeypatch, tmp_path)
-    client = ScreenThenVerify()
-    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
-                                       settings, client)
-    screened = [name for call in client.screen_calls for name in call]
-    assert sorted(screened) == sorted(p.name for p in paths)  # every paper seen exactly once
-    assert len(client.screen_calls) == 2
-    expected = {p.name for p in paths if p.name.endswith("7.pdf")}
-    assert {name for call in client.verify_calls for name in call} == expected
-    assert len(client.verify_calls) == 1
-    assert {item["filename"] for item in result["papers"]} == expected
-    validate_answer("Literature_Retrieval", result)
+def test_facet_keyword_brings_a_globally_weak_paper_into_the_shortlist():
+    from handlers.b_retrieval import _candidate_papers
+    from core.paperlib import Paper
+    papers = [Paper(Path(f"g{i:02d}.pdf"), f"g{i:02d}.pdf", "speculative decoding latency serving " * 3)
+              for i in range(10)]
+    papers.append(Paper(Path("tree.pdf"), "tree.pdf", "token tree verification"))
+    shortlist = _candidate_papers("speculative decoding latency serving tree verification",
+                                  ["tree verification"], papers, size=4)
+    assert "tree.pdf" in {paper.filename for paper in shortlist}
+    assert len(shortlist) == 4
 
 
-def test_failed_screen_batch_passes_its_papers_to_verification(settings, tmp_path, monkeypatch):
-    import dataclasses
-    settings = dataclasses.replace(settings, case_budget=540.0)  # B's real limit; 180 s leaves no screen time
-    _large_corpus(monkeypatch, tmp_path)
-    client = ScreenThenVerify(fail_screen_batches={0})
-    RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
-    verified = {name for call in client.verify_calls for name in call}
-    assert set(client.screen_calls[0]) <= verified
-    assert {n for n in client.screen_calls[1] if n.endswith("7.pdf")} <= verified
-    assert not {n for n in client.screen_calls[1] if not n.endswith("7.pdf")} & verified
-
-
-def test_small_library_skips_the_screen(settings, tmp_path, monkeypatch):
-    _large_corpus(monkeypatch, tmp_path, count=30)
-    client = ScreenThenVerify()
-    RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
-    assert client.screen_calls == []
-    assert sum(len(call) for call in client.verify_calls) == 30
-
-
-def test_screen_out_of_time_passes_unscreened_papers_through(settings, tmp_path):
-    from handlers.b_retrieval import RetrievalLimits, _screen
-
-    def make(name):
-        return MaterialRecord(path=tmp_path / name, filename=name, sha256="t", bytes=1, pages=1,
-                              title=name, abstract="Adaptive decoding", text="Adaptive decoding")
-
-    ranked = [(make("first.pdf"), 1.0), (make("second.pdf"), 0.5)]
-
-    class Clock:
-        """Plenty of time for the first batch, then too little for another."""
-        def __init__(self):
-            self.values = [300.0, 10.0]
-
-        def remaining(self):
-            return self.values.pop(0) if len(self.values) > 1 else self.values[0]
-
-        def timeout(self, value, **kwargs):
-            return value
-
-    limits = RetrievalLimits(screen_batch=1)
-    client = FakeClient(['{"papers":[{"filename":"first.pdf"}]}'])
-    kept = _screen(client, "adaptive decoding", "", ranked, "adaptive decoding", limits, Clock(), settings, "B-01")
-    assert len(client.calls) == 1
-    assert kept == {"first.pdf", "second.pdf"}
-
-
-class _ClockDeadline:
-    """Deadline whose time advances only when the fake model 'runs'."""
-
-    def __init__(self, remaining):
-        self.left = remaining
-
-    def remaining(self):
-        return max(0.0, self.left)
-
-    def timeout(self, maximum, *, reserve=0.0, minimum=1.0, label="operation"):
-        available = min(maximum, self.left - reserve)
-        if available < minimum:
-            raise TimeoutError(label)
-        return available
-
-
-def _screen_case(settings, start, seconds_per_paper=160 / 70):
-    from handlers.b_retrieval import RetrievalLimits, _screen
-    records = [MaterialRecord(Path(f"p{i:03d}.pdf"), f"p{i:03d}.pdf", "a" * 64, 1, 1, "T", "A",
-                              "speculative decoding latency study")
-               for i in range(120)]
-    ranked = [(record, 1.0 / (i + 1)) for i, record in enumerate(records)]
-    deadline = _ClockDeadline(start)
-    calls = []
-
-    class Model:
-        def complete(self, messages, **kwargs):
-            names = re.findall(r"^\d+\. (p\d+\.pdf)", messages[-1]["content"], re.M)
-            calls.append(len(names))
-            deadline.left -= seconds_per_paper * len(names)
-            return json.dumps({"papers": [{"filename": name} for name in names[::3]]})
-
-    kept = _screen(Model(), "q", "", ranked, "q", RetrievalLimits(), deadline, settings, "B-01")
-    return kept, calls, deadline
-
-
-def test_screening_stops_early_to_leave_rerank_time_and_passes_the_rest_through(settings):
-    # Stress simulation (1.5x latency): two screens left 92 s, the first rerank
-    # timed out and the whole B case failed with no answer.
-    kept, calls, deadline = _screen_case(settings, start=400)
-    assert calls == [70]                       # the second screen would not leave rerank time
-    assert {f"p{i:03d}.pdf" for i in range(70, 120)} <= kept   # unscreened papers pass through
-    assert deadline.remaining() == pytest.approx(240)
-
-
-def test_screening_continues_when_rerank_time_remains(settings):
-    kept, calls, deadline = _screen_case(settings, start=600)
-    assert calls == [70, 50]
-    assert not ({f"p{i:03d}.pdf" for i in range(70, 120)} <= kept)
-
-
-def test_every_screen_request_timeout_leaves_the_rerank_reserve(settings):
-    # Review: with 200 s left and a 150 s reserve, the first screen request
-    # still got a 200 s timeout; a hanging gateway then left nothing for rerank.
-    import dataclasses
-    from handlers.b_retrieval import RetrievalLimits, _screen
-    settings = dataclasses.replace(settings, request_timeout=300.0)  # production default
-    records = [MaterialRecord(Path(f"p{i:03d}.pdf"), f"p{i:03d}.pdf", "a" * 64, 1, 1, "T", "A", "text")
-               for i in range(120)]
-    ranked = [(record, 1.0) for record in records]
-    for start in (200, 400):
-        deadline = _ClockDeadline(start)
-        timeouts = []
-
-        class Hanging:
-            def complete(self, messages, timeout=None, **kwargs):
-                timeouts.append(timeout)
-                deadline.left -= timeout  # the gateway uses the whole timeout
-                raise TimeoutError("hung")
-
-        kept = _screen(Hanging(), "q", "", ranked, "q", RetrievalLimits(), deadline, settings, "B-01")
-        assert all(value <= start - 150 + 1e-6 for value in timeouts)
-        assert deadline.remaining() >= 150 - 1e-6
-        assert kept is None or len(kept) == 120  # nothing judged: everything passes through
+def test_selection_is_retried_once_after_a_failed_call(settings, tmp_path, monkeypatch):
+    paths = _corpus(monkeypatch, tmp_path, count=2)
+    reply = json.dumps({"papers": [{"filename": paths[0].name, "reason": "正文研究自适应解码。"}]}, ensure_ascii=False)
+    client = FakeClient(["truncated {", reply])
+    result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding"}, settings, client)
+    assert [item["filename"] for item in result["papers"]] == [paths[0].name]
+    assert len(client.calls) == 2

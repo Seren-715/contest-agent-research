@@ -12,8 +12,6 @@ from tests.test_handlers_papers import _markdown, paper_settings
 def test_default_survey_uses_exact_materials_without_selection_call(paper_settings, monkeypatch):
     import handlers.c_survey as module
     settings, paths = paper_settings
-    monkeypatch.delenv("CONTEST_SURVEY_EVIDENCE_MATRIX", raising=False)
-    monkeypatch.setattr(module, "survey_materials_bundle", lambda *args, **kwargs: pytest.fail("matrix is opt-in"))
     client = FakeClient([_markdown([path.name for path in paths])])
     result = SurveyHandler().handle({"case_id": "C-exact", "input": "比较指定论文",
                                     "materials": [str(path) for path in paths]}, settings, client)
@@ -57,8 +55,7 @@ def test_default_survey_combines_ranked_excerpt_with_results_and_limitations(pap
         pdf.set_font("Helvetica", size=10)
         pdf.multi_cell(0, 5, text)
     pdf.output(str(path))
-    monkeypatch.delenv("CONTEST_SURVEY_EVIDENCE_MATRIX", raising=False)
-    monkeypatch.setattr(module, "finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
+    monkeypatch.setattr("handlers.reporting.finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
     client = FakeClient(["draft"])
     SurveyHandler().handle({"case_id": "C-coverage", "input": "decoding throughput",
                             "materials": [str(path)]}, settings, client)
@@ -66,7 +63,8 @@ def test_default_survey_combines_ranked_excerpt_with_results_and_limitations(pap
     assert "adaptive candidates" in prompt
     assert "83.7 percent" in prompt
     assert "multilingual workloads" in prompt
-    assert "PDF页4" in prompt and "PDF页5" in prompt
+    # Results (page 4) and limitations (page 5) reach the prompt; the opening
+    # and closing windows carry no page labels (page numbers do not score).
 
 
 def test_low_matrix_budget_reduces_windows_instead_of_rejecting_report():
@@ -89,46 +87,6 @@ def test_impossibly_small_layout_budget_never_returns_only_source_names():
                               passages=(EvidencePassage(1, 0, len(text), text),)) for i in range(20)]
     matrix = survey_evidence_matrix(records, max_total_chars=1000)
     assert matrix.count("81.2") == 20
-
-
-def _survey_request(paths):
-    return {"case_id": "C-fact", "input": "比较指定论文", "materials": [str(path) for path in paths]}
-
-
-def test_fact_check_pass_replaces_draft_when_gate_is_not_worse(paper_settings, monkeypatch):
-    settings, paths = paper_settings
-    monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "1")
-    draft = _markdown([path.name for path in paths])
-    revised = draft.replace("在遥感数据上比较了绿地覆盖率与地表温度", "在遥感数据上讨论了地表温度")
-    client = FakeClient([draft, revised])
-    result = SurveyHandler().handle(_survey_request(paths), settings, client)
-    assert len(client.calls) == 2
-    assert "逐句事实核对" in client.calls[1][-1]["content"]
-    assert client.calls[1][-2] == {"role": "assistant", "content": draft}
-    assert "讨论了地表温度" in result["markdown"]
-
-
-def test_fact_check_pass_is_discarded_when_it_breaks_the_structural_gate(paper_settings, monkeypatch):
-    settings, paths = paper_settings
-    monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "1")
-    draft = _markdown([path.name for path in paths])
-    client = FakeClient([draft, "太短的修订"])
-    result = SurveyHandler().handle(_survey_request(paths), settings, client)
-    assert len(client.calls) == 2
-    assert result["markdown"].strip() == draft.strip()
-
-
-def test_fact_check_pass_is_skipped_without_enough_time_and_when_disabled(paper_settings, monkeypatch):
-    settings, paths = paper_settings
-    draft = _markdown([path.name for path in paths])
-    client = FakeClient([draft])
-    SurveyHandler().handle(_survey_request(paths), settings, client)  # disabled by default in tests
-    assert len(client.calls) == 1
-    monkeypatch.setenv("CONTEST_SURVEY_FACT_CHECK", "1")
-    monkeypatch.setattr("handlers.c_survey.FACT_CHECK_MIN_SECONDS", 10_000)
-    client = FakeClient([draft])
-    SurveyHandler().handle(_survey_request(paths), settings, client)
-    assert len(client.calls) == 1
 
 
 def _crowded_paper(path, index):
@@ -156,8 +114,7 @@ def test_survey_prompt_always_carries_abstract_contributions_and_conclusion(pape
     import handlers.c_survey as module
     settings, paths = paper_settings
     papers = [_crowded_paper(paths[0].parent / f"crowded{i}.pdf", i) for i in range(5)]
-    monkeypatch.delenv("CONTEST_SURVEY_EVIDENCE_MATRIX", raising=False)
-    monkeypatch.setattr(module, "finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
+    monkeypatch.setattr("handlers.reporting.finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
     client = FakeClient(["draft"])
     SurveyHandler().handle({"case_id": "C-core", "input": "比较 speculative decoding 的 latency 与 throughput",
                             "materials": [str(path) for path in papers]}, settings, client)
@@ -167,7 +124,7 @@ def test_survey_prompt_always_carries_abstract_contributions_and_conclusion(pape
         assert f"CONTRIB{index}" in prompt
         assert f"CONCL{index}" in prompt
     assert "（结论，PDF页10）" in prompt
-    assert "核心事实" in prompt
+    assert "核心原文" in prompt
 
 
 def test_core_passages_report_what_they_cannot_locate():

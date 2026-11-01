@@ -64,5 +64,6 @@ def test_existing_or_mixed_attributed_result_still_requires_source(sentence) -> 
 def test_illegal_citation_and_genuinely_uncited_survey_are_still_blocked() -> None:
     report = audit_report(_report("实验拟设置候选模型 [9]。"), [_record()], "Idea")
     assert any(finding.category == "invalid_citation" for finding in report.blockers)
-    survey = audit_report(_report("指标包括准确率和吞吐，主指标用于比较所设定的候选方案。"), [_record()], "Survey")
+    # Survey citations cover their own paragraph only: make the claim a paragraph of its own.
+    survey = audit_report(_report("\n指标包括准确率和吞吐，主指标用于比较所设定的候选方案。\n"), [_record()], "Survey")
     assert any(finding.category == "unsupported_claim" for finding in survey.blockers)

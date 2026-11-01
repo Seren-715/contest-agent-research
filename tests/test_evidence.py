@@ -152,7 +152,8 @@ def test_idea_reported_or_mixed_claim_still_requires_citation(sentence) -> None:
 
 
 def test_survey_fact_gate_is_not_changed_by_idea_design_exception() -> None:
-    markdown = _survey("计划采用准确率和吞吐指标进行实验比较，并将验收阈值定义为百分之一。\n材料范围 [1]。", "[1] a.pdf")
+    # Survey citations are per paragraph: the uncited plan sentence stands alone.
+    markdown = _survey("计划采用准确率和吞吐指标进行实验比较，并将验收阈值定义为百分之一。\n\n材料范围 [1]。", "[1] a.pdf")
     report = audit_report(markdown, [_record("a.pdf", "Source")], "Survey")
     assert any(item.category == "unsupported_claim" for item in report.blockers)
 
@@ -171,3 +172,11 @@ def test_idea_section_layout_is_quality_warning_not_schema_failure() -> None:
 def test_idea_citation_requirements_remain_blocking(body, refs, category) -> None:
     report = audit_report(_survey(body, refs), [_record("a.pdf", "Source")], "Idea")
     assert any(item.category == category for item in report.blockers)
+
+
+def test_survey_citation_covers_its_paragraph_but_not_the_next() -> None:
+    record = _record("a.pdf", "Source")
+    cited = _survey("方法在基准上提升了百分之五的准确率。第二句仍属同一段 [1]。", "[1] a.pdf")
+    assert not [item for item in audit_report(cited, [record], "Survey").blockers if item.category == "unsupported_claim"]
+    uncited = _survey("材料范围 [1]。\n\n方法在基准上提升了百分之五的准确率。", "[1] a.pdf")
+    assert any(item.category == "unsupported_claim" for item in audit_report(uncited, [record], "Survey").blockers)

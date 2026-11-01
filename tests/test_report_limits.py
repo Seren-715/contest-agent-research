@@ -97,7 +97,8 @@ def test_over_limit_draft_requests_complete_model_repair(settings, monkeypatch, 
     module = importlib.import_module(module_name)
     settings.ensure_dirs()
     monkeypatch.setattr(module, "select_report_materials", lambda *args: [Path("a.pdf")])
-    monkeypatch.setattr(module, "materials_bundle", lambda *args, **kwargs: ("[1] a.pdf 原文摘录", [_record()]))
+    bundle = "survey_bundle" if function == "Survey" else "materials_bundle"
+    monkeypatch.setattr(module, bundle, lambda *args, **kwargs: ("[1] a.pdf 原文摘录", [_record()]))
     valid = _valid_draft()
     assert not report_limit_errors(valid, function)
     oversized = valid.replace("## 参考文献", "长" * 5000 + "\n## 参考文献")
@@ -110,7 +111,9 @@ def test_over_limit_draft_requests_complete_model_repair(settings, monkeypatch, 
     )
     assert len(client.calls) == 2
     assert "maximum" in client.calls[1][-1]["content"]
-    assert "完整修订版" in client.calls[1][-1]["content"]
+    assert ("完整修订报告" if function == "Survey" else "完整修订版") in client.calls[1][-1]["content"]
+    # The revision sees the original task and the complete previous draft.
+    assert [message["role"] for message in client.calls[1]] == ["system", "user", "assistant", "user"]
     if function == "Idea":
         assert [message["role"] for message in client.calls[1]] == ["system", "user", "assistant", "user"]
         assert client.calls[1][:2] == client.calls[0]

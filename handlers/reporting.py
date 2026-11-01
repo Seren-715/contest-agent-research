@@ -23,11 +23,13 @@ from typing import Any
 from core.config import Settings
 from core.budget import Deadline
 from core.io import write_report
-from core.execution import check_active
+from core.execution import ExecutionCancelled, check_active
+from core.llm import ModelError, output_budget
 from core.paperlib import MaterialRecord, evidence_excerpt, index_materials, terms
 from core.schemas import report_limit_errors
 from handlers.base import HandlerError, strip_fences
 from handlers.evidence import AuditReport, audit_report, ensure_coverage
+from handlers.survey_format import render_survey
 
 REFERENCE_MARKER = "## 参考文献"
 
@@ -258,6 +260,120 @@ def core_evidence(records: list[MaterialRecord], **limits: int) -> str:
         note = ("未定位：" + "、".join(missing) + "（不等于论文没有）\n") if missing else ""
         blocks.append(f"[{index}] 完整文件名：{record.filename}\n标题：{record.title[:200]}\n" + note + "\n".join(lines))
     return "\n\n".join(blocks)
+
+
+def survey_bundle(
+    paths: list[Path], *, query: str = "", per_paper: int = 10000, deadline: Deadline | None = None,
+) -> tuple[str, list[MaterialRecord]]:
+    """Survey evidence per paper, numbered in material order.
+
+    Follows the team version that scored C 23.5/25 (eval 2026-10-26): a
+    query-ranked excerpt plus the opening and closing text, within
+    max(3000, min(10000, 60000 // papers)) characters. The closing window ends
+    before the reference list, and the located abstract, contribution
+    statement and conclusion with page labels come first.
+    """
+    records = index_materials(paths, deadline=deadline)
+    blocks: list[str] = []
+    for index, record in enumerate(records, start=1):
+        check_active()
+        core = "\n".join(f"（{label}，" + ("PDF页" + "-".join(map(str, used)) if used and used[0] else "页码未定位")
+                         + f"）{quote}" for label, used, quote in core_passages(record))
+        room = max(0, per_paper - len(core))
+        excerpt = evidence_excerpt(record, query=query, max_chars=max(600, room // 3)) if room else ""
+        width = max(0, room - len(excerpt) - 80) // 2
+        # The text before the reference list, so the back window holds the
+        # last sections (results, limitations), not bibliography entries.
+        body = record.text
+        backs = [match for match in _BACK_MATTER.finditer(body) if match.start() > len(body) // 2]
+        if backs:
+            body = body[:backs[0].start()]
+        flat = " ".join(body.split())
+        front = flat[:width]
+        back = flat[max(width, len(flat) - width):] if len(flat) > width else ""
+        parts = [f"[{index}] 完整文件名：{record.filename}"]
+        if core:
+            parts.append("核心原文：\n" + core)
+        if excerpt:
+            parts.append("按任务检索的摘录：\n" + excerpt)
+        if front:
+            parts.append("原文前部：\n" + front)
+        if back:
+            parts.append("原文后部（参考文献前；与前部之间已省略）：\n" + back)
+        if not record.text.strip():
+            parts.append("无法提取正文；不得推断该论文的具体方法、数值或结论。")
+        blocks.append("\n".join(parts))
+    return "\n\n".join(blocks), records
+
+
+SURVEY_REVISION_RULES = (
+    "正文目标 3000～3800 字符，最多 5000。逐篇保留原材料实际报告的研究方法、数据、条件和结果；"
+    "不要把已报告的论文事实改成‘拟’或‘计划’，不要把一篇的方法迁移给另一篇。"
+    "未提供的方法或数字说明摘录未提供；作者没有给出的信息不能推断为作者没有做。"
+)
+
+
+def generate_survey(
+    client: Any, settings: Settings, case_id: str, system: str, prompt: str,
+    records: list[MaterialRecord], paths: list[Path], deadline: Deadline, *, repair_attempts: int = 2,
+) -> dict[str, Any]:
+    """Generate, render, audit and completely revise a Survey (team C pipeline).
+
+    The first draft that passes the evidence gate is published. Each revision
+    sees the previous complete draft plus the audit findings and must return a
+    complete report. If no draft passes, the rendered draft with the fewest
+    blockers goes through finalize(), whose coverage completion is the final,
+    verbatim-only rescue; a revision that is worse never replaces it.
+    """
+    previous = ""
+    feedback = ""
+    fallback: tuple[int, str] | None = None  # rendered draft with the fewest blockers
+    last_error: Exception | None = None
+    for attempt in range(repair_attempts + 1):
+        check_active()
+        if attempt and deadline.remaining() < 30:
+            break
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        if attempt and previous:
+            messages.extend([
+                {"role": "assistant", "content": previous},
+                {"role": "user", "content": "【必须修复的问题】\n" + feedback
+                 + "\n返回完整修订报告，不能照抄上一版，不能只承诺修改或返回补丁。" + SURVEY_REVISION_RULES
+                 + "把每段相关引用合并为段末一组 [1,2]，正文目标不超过 25 组；表格每行最多一组。"
+                   "删除材料中没有依据的外部系统参数和数字，不要靠添加引用冒充依据。"},
+            ])
+        try:
+            timeout = deadline.timeout(settings.request_timeout, reserve=10.0, label="survey generation")
+            text = client.complete(messages, temperature=0.2 if attempt else 0.25,
+                                   max_tokens=output_budget(), timeout=timeout)
+        except (ModelError, TimeoutError) as exc:
+            if isinstance(exc, ExecutionCancelled):
+                raise
+            check_active()
+            logging.getLogger(__name__).warning("survey_generation_failed case_id=%s attempt=%d", case_id, attempt)
+            last_error = exc
+            feedback = "上一次模型请求失败，需要重新生成完整报告。"
+            continue
+        previous = strip_fences(text).strip() + "\n"
+        try:
+            markdown = render_survey(previous, records)
+        except HandlerError as exc:
+            feedback = str(exc) + "\n请按 sections/comparison JSON 结构返回，引用编号只放 citations/paper 字段，正文不写方括号编号。"
+            continue
+        report = audit(markdown, records, "Survey")
+        if not report.blockers:
+            return finalize(settings, "Survey", case_id, markdown, paths, records=records)
+        if fallback is None or len(report.blockers) < fallback[0]:
+            fallback = (len(report.blockers), markdown)
+        feedback = (report.repair_text(limit=20)
+                    + "\n请按 sections/comparison JSON 结构返回，引用编号只放 citations/paper 字段，正文不写方括号编号。")
+    if fallback is not None:
+        return finalize(settings, "Survey", case_id, fallback[1], paths, records=records)
+    if last_error is not None:
+        # No draft at all: keep the gateway's own error for the caller's
+        # fallback and diagnostics.
+        raise last_error
+    raise HandlerError("survey did not produce a usable draft: " + feedback[:300])
 
 
 def survey_materials_bundle(

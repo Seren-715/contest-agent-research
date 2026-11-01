@@ -163,6 +163,19 @@ def build_ledger(markdown: str, record_count: int, function: str = "Survey") -> 
     # so a heading cannot swallow the first factual sentence of its section.
     body = re.sub(r"^\s{0,3}#{1,6}\s+.*$", "", body, flags=re.MULTILINE)
     ledger: list[Claim] = []
+    if function == "Survey":
+        # The public rules allow one citation group for a coherent paragraph
+        # (and cap the body at 40 groups); the Survey generator writes one
+        # group at each paragraph end. A cited paragraph is one claim; an
+        # uncited paragraph is still checked sentence by sentence.
+        for paragraph in re.split(r"\n\s*\n", body):
+            values = citation_ids(paragraph)
+            if values:
+                ledger.append(Claim(paragraph.strip(), values, all(1 <= value <= record_count for value in values)))
+            else:
+                ledger.extend(Claim(sentence, [], False) for sentence in sentence_split(paragraph)
+                              if _is_fact_claim(sentence, function))
+        return ledger
     for sentence in sentence_split(body):
         values = citation_ids(sentence)
         if values:

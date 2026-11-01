@@ -93,9 +93,7 @@ def test_matrix_quote_window_keeps_keyword_far_into_passage():
     assert "原文字符[50:" not in matrix
 
 
-@pytest.mark.parametrize("use_matrix", [False, True])
-def test_survey_includes_seventh_specified_pdf_and_saves_it(paper_settings, monkeypatch, use_matrix):
-    monkeypatch.setenv("CONTEST_SURVEY_EVIDENCE_MATRIX", "1" if use_matrix else "0")
+def test_survey_includes_seventh_specified_pdf_and_saves_it(paper_settings):
     settings, paths = paper_settings
     for index in range(2):
         path = paths[0].parent / f"additional{index}.pdf"
@@ -107,20 +105,25 @@ def test_survey_includes_seventh_specified_pdf_and_saves_it(paper_settings, monk
                                     "materials": [str(p) for p in paths]}, settings, client)
     assert paths[-1].name in result["markdown"]
     assert paths[-1].name in client.calls[0][1]["content"]
-    assert ("候选证据矩阵" in client.calls[0][1]["content"]) is use_matrix
     assert (settings.workspace_root / result["path"]).read_text(encoding="utf-8") == result["markdown"]
+
+
+def _with_uncited_paragraph(markdown):
+    # Survey citations cover their own paragraph: this claim stands alone.
+    return markdown.replace("## 方法与技术脉络\n", "## 方法与技术脉络\n该方法准确率达到0.9。\n\n")
 
 
 def test_survey_repair_receives_draft_and_preserves_source_context(paper_settings):
     settings, paths = paper_settings
-    draft = _markdown([p.name for p in paths]).replace("## 方法与技术脉络\n", "## 方法与技术脉络\n该方法准确率达到0.9。\n")
+    draft = _with_uncited_paragraph(_markdown([p.name for p in paths]))
     valid = _markdown([p.name for p in paths])
     client = FakeClient([draft, valid])
     result = SurveyHandler().handle({"case_id": "C-fix", "input": "比较论文",
                                     "materials": [str(p) for p in paths]}, settings, client)
     assert len(client.calls) == 2
-    assert client.calls[1][2] == {"role": "assistant", "content": draft}
-    assert "仅修复指出的问题" in client.calls[1][3]["content"]
+    assert client.calls[1][2] == {"role": "assistant", "content": draft.strip() + "\n"}
+    assert "必须修复的问题" in client.calls[1][3]["content"]
+    assert client.calls[1][:2] == client.calls[0]  # same task and evidence
     assert result["markdown"].strip() == valid.strip()
 
 
@@ -138,26 +141,59 @@ def test_survey_does_not_start_repair_without_remaining_budget(paper_settings, m
             return 20
 
     settings, paths = paper_settings
-    draft = _markdown([p.name for p in paths]).replace("## 方法与技术脉络\n", "## 方法与技术脉络\n该方法准确率达到0.9。\n")
+    draft = _with_uncited_paragraph(_markdown([p.name for p in paths]))
     monkeypatch.setattr(module, "Deadline", ShortDeadline)
     # Capture the existing draft at finalization; an invalid draft must still
     # face the real finalizer's gate, not trigger an unbudgeted second call.
-    monkeypatch.setattr(module, "finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
+    monkeypatch.setattr("handlers.reporting.finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
     client = FakeClient([draft])
     result = SurveyHandler().handle({"case_id": "C-short", "input": "比较论文",
                                     "materials": [str(p) for p in paths]}, settings, client)
     assert len(client.calls) == 1
-    assert result == draft
+    assert result == draft.strip() + "\n"
 
 
 def test_survey_keeps_draft_when_repair_is_worse(paper_settings, monkeypatch):
-    import handlers.c_survey as module
-
     settings, paths = paper_settings
-    draft = _markdown([p.name for p in paths]).replace("## 方法与技术脉络\n", "## 方法与技术脉络\n该方法准确率达到0.9。\n")
+    draft = _with_uncited_paragraph(_markdown([p.name for p in paths]))
     client = FakeClient([draft, "这是一份没有证据和格式的回答。"])
-    monkeypatch.setattr(module, "finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
+    monkeypatch.setattr("handlers.reporting.finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
     result = SurveyHandler().handle({"case_id": "C-regression", "input": "比较论文",
                                     "materials": [str(p) for p in paths]}, settings, client)
+    assert len(client.calls) == 3  # two complete revisions, both worse
+    assert result == draft.strip() + "\n"
+
+
+def test_json_survey_is_rendered_with_paragraph_citations_and_references(paper_settings):
+    import json
+    settings, paths = paper_settings
+    paragraph = "该研究比较了指定条件下的绿地覆盖与地表温度，并说明了数据来源和适用边界。" * 4
+    sections = [{"heading": heading, "paragraphs": [{"text": paragraph, "citations": list(range(1, len(paths) + 1))}]}
+                for heading in ("引言与研究问题", "方法与技术脉络", "数据与评价指标比较", "结论、局限与冲突")]
+    comparison = [{"paper": index, "problem": "地表温度", "method": "遥感", "data": "摘录未提供",
+                   "metrics": "摘录未提供", "findings": "降温", "limitations": "摘录未提供"}
+                  for index in range(1, len(paths) + 1)]
+    reply = json.dumps({"sections": sections, "comparison": comparison}, ensure_ascii=False)
+    client = FakeClient([reply])
+    result = SurveyHandler().handle({"case_id": "C-json", "input": "比较论文",
+                                    "materials": [str(p) for p in paths]}, settings, client)
+    assert len(client.calls) == 1
+    markdown = result["markdown"]
+    assert "## 方法与技术脉络" in markdown and "## 逐篇证据比较" in markdown
+    assert paragraph + " [" + ",".join(str(i) for i in range(1, len(paths) + 1)) + "]" in markdown
+    for index, path in enumerate(paths, start=1):
+        assert f"[{index}] {path.name}" in markdown.partition("## 参考文献")[2]
+    assert "sections" in client.calls[0][1]["content"]
+
+
+def test_json_with_bracket_citations_in_text_is_sent_back_for_revision(paper_settings, monkeypatch):
+    import json
+    settings, paths = paper_settings
+    bad = json.dumps({"sections": [{"heading": "引言与研究问题",
+                                    "paragraphs": [{"text": "正文里写了 [1] 编号。", "citations": [1]}]}]},
+                     ensure_ascii=False)
+    client = FakeClient([bad, _markdown([p.name for p in paths])])
+    SurveyHandler().handle({"case_id": "C-struct", "input": "比较论文",
+                            "materials": [str(p) for p in paths]}, settings, client)
     assert len(client.calls) == 2
-    assert result == draft
+    assert "Survey structure error" in client.calls[1][-1]["content"]
