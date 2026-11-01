@@ -21,9 +21,15 @@ def _fail(settings, monkeypatch, materials):
     return caught.value
 
 
-def test_missing_declared_material_decodes_as_resolution_not_found(settings, monkeypatch):
-    error = _fail(settings, monkeypatch, ["missing.pdf"])
-    assert failure_delay(settings, "B-01", error) == 20 * 2 + 7  # lenient B: nothing could be resolved
+@pytest.mark.parametrize("materials,expected", [
+    (["missing.pdf"], 200 + 20 * 3 + 0),            # bare PDF names, not found
+    (["data/论文库/x.pdf", "data/论文库/y.pdf"], 200 + 20 * 1 + 0),  # data-relative paths
+    (["/elsewhere/x.pdf"], 200 + 20 * 0 + 0),       # absolute paths
+    (["论文合集"], 200 + 20 * 5 + 0),                # CJK name without suffix
+])
+def test_unresolvable_b_materials_encode_entry_shape_and_reason(settings, monkeypatch, materials, expected):
+    error = _fail(settings, monkeypatch, materials)
+    assert failure_delay(settings, "B-01", error) == expected
 
 
 def test_non_pdf_material_decodes_as_header_check(settings, monkeypatch):
@@ -41,3 +47,16 @@ def test_unexpected_os_error_and_missing_diagnostics(settings):
 def test_timing_code_can_be_disabled(settings, monkeypatch):
     monkeypatch.setenv("CONTEST_FAILURE_TIMING", "0")
     assert failure_delay(settings, "B-01", ValueError("x")) == 0
+
+
+@pytest.mark.parametrize("message,code", [
+    ("report body has 5200 characters; Idea maximum is 4500", 1),
+    ("report body has 300 characters; at least 800 required excluding references/headings", 2),
+    ("事实性语句没有可追溯引用：……", 6),
+    ("引用编号超出指定材料范围：7", 7),
+    ("正文没有任何 [编号] 引用。", 5),
+])
+def test_idea_failure_codes(message, code):
+    from core.failure_code import idea_failure_delay
+    from handlers.base import HandlerError
+    assert idea_failure_delay(HandlerError(message)) == 40 * code

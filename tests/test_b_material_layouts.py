@@ -173,3 +173,19 @@ def test_report_selection_uses_an_existing_description_like_folder_directly(moun
     client = FakeClient([])
     paths = select_report_materials({"case_id": "C-01", "materials": ["指定论文"]}, settings, client, Deadline(300))
     assert paths == designated and not client.calls  # no model selection, no other folder
+
+
+def test_data_relative_path_is_found_one_level_deeper_under_a_team_folder(mount):
+    data, root = mount
+    paper = _pdf(root / "my-team" / "论文库" / "x.pdf")
+    _pdf(root / "experiments" / "论文库" / "x.pdf")  # task tree: never searched
+    assert resolve_materials(["data/论文库/x.pdf"], data) == [paper]
+    assert resolve_materials(["data/论文库"], data) == [paper]
+
+
+def test_deeper_suffix_match_must_be_unique(mount):
+    data, root = mount
+    _pdf(root / "team-a" / "论文库" / "x.pdf", b"%PDF-a")
+    _pdf(root / "team-b" / "论文库" / "x.pdf", b"%PDF-b")
+    with pytest.raises(MaterialResolutionError, match="ambiguous"):
+        resolve_materials(["data/论文库/x.pdf"], data)

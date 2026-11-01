@@ -9,6 +9,7 @@ language, and the boundary between simulated observations and paper conclusions.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from dataclasses import replace
 
@@ -16,7 +17,7 @@ from core.config import Settings, case_budget_seconds
 from core.budget import Deadline
 from core.diagnostics import record_stage
 from core.execution import check_active
-from core.llm import ModelClient, output_budget
+from core.llm import ModelClient, ModelError, output_budget
 from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
 from handlers.evidence import novelty_overlap
@@ -57,6 +58,9 @@ CHECKLIST = (
     "「可行性与失败边界」要同时说明场景可行性、落地约束（算力、延迟、数据权限、工程成本）和失败边界；"
     "「创新论证与可证伪方式」要给出可证伪的预测和判定阈值。"
 )
+
+
+IDEA_REPAIRS = 2
 
 
 class IdeaHandler:
@@ -102,19 +106,31 @@ class IdeaHandler:
         )
         markdown = text.strip()
         report = audit(markdown, records, "Idea")
-        if report.blockers and deadline.remaining() >= 30:
+        # Up to two complete model rewrites; keep whichever draft has the
+        # fewest blockers. No programmatic padding or splicing (repo rule).
+        for attempt in range(IDEA_REPAIRS):
+            if not report.blockers or deadline.remaining() < (30 if attempt == 0 else 120):
+                break
+            record_stage(settings, case_id, "model_repair", attempt=attempt + 1,
+                         blockers=sorted({item.category for item in report.blockers}))
             repair = (
                 "【证据闸门未通过】\n"
                 + report.repair_text()
                 + "\n\n请返回完整修订版（不要只给差异）：补齐引用和参考文献，删除无法核验的事实，"
                 "保留全部要求的小节，只输出 Markdown 正文。"
+                "正文（标题行和参考文献节除外）必须在800～4500字符之间，目标约3000字符。"
             )
             messages = messages + [{"role": "assistant", "content": text}, {"role": "user", "content": repair}]
-            text = complete(
-                messages,
-                0.2,
-            )
-            markdown = text.strip()
+            try:
+                text = complete(messages, 0.2)
+            except (ModelError, TimeoutError):
+                check_active()
+                logging.getLogger(__name__).warning("idea_repair_failed case_id=%s attempt=%d", case_id, attempt + 1)
+                break
+            candidate = text.strip()
+            candidate_report = audit(candidate, records, "Idea")
+            if len(candidate_report.blockers) <= len(report.blockers):
+                markdown, report = candidate, candidate_report
         return finalize(
             settings,
             "Idea",

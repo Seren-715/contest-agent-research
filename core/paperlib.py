@@ -525,9 +525,65 @@ def _paper_roots(settings_data_dir: Path) -> list[Path]:
 
 
 class MaterialResolutionError(RuntimeError):
-    def __init__(self, message: str):
+    def __init__(self, message: str, *, skipped: Optional[dict] = None, shapes: Optional[dict] = None):
         logging.getLogger(__name__).warning("material_resolution_failed reason=%s", message.split(":", 1)[0])
         super().__init__(message)
+        # Diagnostic counts only (never file names): skip reasons and the
+        # shapes of the declared entries, see core/failure_code.py.
+        self.skipped = dict(skipped or {})
+        self.shapes = dict(shapes or {})
+
+
+def material_shape(value: object) -> str:
+    """Coarse form of a declared material, for diagnostics without names."""
+    if not isinstance(value, str) or not value.strip():
+        return "other"
+    text = value.strip()
+    path = Path(text)
+    if path.is_absolute():
+        return "absolute"
+    if path.parts and path.parts[0] == "data" and len(path.parts) > 1:
+        return "data_relative"
+    if len(path.parts) > 1:
+        return "relative"
+    if path.suffix.lower() == ".pdf":
+        return "pdf_name"
+    if path.suffix:
+        return "other_suffix"
+    return "cjk_name" if re.search(r"[\u4e00-\u9fff]", text) else "ascii_name"
+
+
+def _suffix_matches(path: Path, bases: list[Path], depth: int = 3) -> list[Path]:
+    """The declared relative path below a deeper directory of a data root.
+
+    "data/论文库" may live at /data/<team>/论文库. Only the complete declared
+    suffix is matched; task/output trees are skipped. Callers still require a
+    unique (or identical) match.
+    """
+    parts = path.parts[1:] if path.parts and path.parts[0] == "data" and len(path.parts) > 1 else path.parts
+    if not parts:
+        return []
+    suffix = Path(*parts)
+    found: list[Path] = []
+    for base in dict.fromkeys(bases):
+        if not base.is_dir():
+            continue
+        frontier = [(base, 0)]
+        while frontier:
+            directory, level = frontier.pop()
+            try:
+                children = sorted(child for child in directory.iterdir() if child.is_dir())
+            except OSError:
+                continue
+            for child in children:
+                if child.name.casefold() in _NOT_A_LIBRARY:
+                    continue
+                candidate = child / suffix
+                if candidate.exists():
+                    found.append(candidate)
+                if level + 1 < depth:
+                    frontier.append((child, level + 1))
+    return list(dict.fromkeys(found))
 
 
 def is_material_description(value: object) -> bool:
@@ -795,6 +851,10 @@ def resolve_materials(
                     found.extend(accept(value for root in roots if root.exists()
                                         for value in root.rglob("*") if value.name == path.name))
             found = list(dict.fromkeys(found))
+            if not found and not path.is_absolute():
+                found = list(dict.fromkeys(accept(_suffix_matches(path, data_bases))))
+                if found:
+                    logging.getLogger(__name__).warning("material_suffix_found matches=%d", len(found))
             if not found and path.suffix:
                 found = list(dict.fromkeys(folded_path_matches(path)))
                 if found:
@@ -860,5 +920,8 @@ def resolve_materials(
     if skipped:
         logging.getLogger(__name__).warning("material_resolution_skipped %s", dict(Counter(skipped)))
         if not unique:
-            raise MaterialResolutionError(f"no declared material could be resolved: {dict(Counter(skipped))}")
+            raw = [materials] if isinstance(materials, str) else (materials if isinstance(materials, list) else [])
+            raise MaterialResolutionError(f"no declared material could be resolved: {dict(Counter(skipped))}",
+                                          skipped=dict(Counter(skipped)),
+                                          shapes=dict(Counter(material_shape(value) for value in raw)))
     return unique

@@ -35,7 +35,7 @@ except ImportError:  # local development without the official base image
 
 from core.config import case_timeout_seconds, load_settings
 from core.execution import ExecutionControl, execution_context
-from core.failure_code import failure_delay
+from core.failure_code import failure_delay, idea_failure_delay
 from core.io import write_result
 from core.schemas import validate_answer
 from core.solve import (
@@ -177,10 +177,14 @@ if HAS_SDK:
                     try:
                         output = _safe_fallback(case_id, function, body)
                     except Exception:
+                        delay = 0
                         if function == "Literature_Retrieval":
                             # The platform shows no logs; encode the failing
                             # phase/error in the visible processing time.
                             delay = failure_delay(load_settings(), case_id, error)
+                        elif function == "Idea":
+                            delay = idea_failure_delay(error)
+                        if delay:
                             logging.getLogger(__name__).warning(
                                 "retrieval_failure_timing case_id=%s delay=%d", case_id, delay)
                             await asyncio.sleep(delay)

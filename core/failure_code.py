@@ -58,9 +58,7 @@ def _last_phase(path: Path) -> int:
 
 def _error_code(error: BaseException) -> int:
     # SolveError wraps the handler's exception; the cause carries the reason.
-    chain = [error]
-    while chain[-1].__cause__ is not None and len(chain) < 5:
-        chain.append(chain[-1].__cause__)
+    chain = _chain(error)
     for exc in reversed(chain):
         names = [cls.__name__ for cls in type(exc).__mro__]
         message = str(exc)
@@ -74,9 +72,69 @@ def _error_code(error: BaseException) -> int:
     return 18
 
 
+SHAPES = {"absolute": 0, "data_relative": 1, "relative": 2, "pdf_name": 3, "other_suffix": 4,
+          "cjk_name": 5, "ascii_name": 6, "other": 7}
+SKIP_REASONS = {"not_found": 0, "ambiguous": 1, "outside_roots": 2, "duplicate_name": 3}
+
+
+def _chain(error: BaseException) -> list[BaseException]:
+    chain = [error]
+    while chain[-1].__cause__ is not None and len(chain) < 5:
+        chain.append(chain[-1].__cause__)
+    return chain
+
+
+def _unresolved_detail(error: BaseException) -> int | None:
+    """200 + 20 * dominant entry shape + dominant skip reason, for B's
+    "no declared material could be resolved" (eval-20261101: all B cases)."""
+    for exc in _chain(error):
+        shapes, skipped = getattr(exc, "shapes", None), getattr(exc, "skipped", None)
+        if shapes or skipped:
+            shape = max(shapes.items(), key=lambda item: (item[1], -SHAPES.get(item[0], 7)))[0] if shapes else "other"
+            reason = max(skipped.items(), key=lambda item: (item[1], -SKIP_REASONS.get(item[0], 3)))[0] if skipped else "not_found"
+            return 200 + 20 * SHAPES.get(shape, 7) + SKIP_REASONS.get(reason, 3)
+    return None
+
+
 def failure_delay(settings: Settings, case_id: str, error: BaseException) -> int:
     """Seconds to wait before reporting a failed retrieval case (0 = disabled)."""
     if os.environ.get("CONTEST_FAILURE_TIMING", "1") == "0":
         return 0
+    detail = _unresolved_detail(error)
+    if detail is not None:
+        return detail
     phase = _last_phase(settings.team_dir / "work" / "diagnostics" / f"{case_id}.json")
     return 20 * phase + _error_code(error)
+
+
+# Idea failures: 40 s per code (normal processing already takes ~10-20 s).
+# Most specific markers first: several messages contain "引用".
+IDEA_REASONS = [
+    ("characters; Idea maximum", 1),          # body too long
+    ("including Markdown headings", 1),
+    ("required excluding references", 2),     # body too short
+    ("'## 参考文献' section", 3),
+    ("占位", 4),
+    ("引用编号超出", 7),                       # invalid citation number
+    ("事实性语句", 6),                         # unsupported_claim
+    ("引用", 5),                              # missing citation / reference entry
+    ("参考文献", 5),
+]
+
+
+def idea_failure_delay(error: BaseException) -> int:
+    """Seconds to wait before reporting a failed Idea case (0 = disabled)."""
+    if os.environ.get("CONTEST_FAILURE_TIMING", "1") == "0":
+        return 0
+    names = {cls.__name__ for exc in _chain(error) for cls in type(exc).__mro__}
+    text = " ".join(str(exc) for exc in _chain(error))
+    if "ModelError" in names:
+        return 40 * 8
+    if "TimeoutError" in names:
+        return 40 * 9
+    if "MaterialResolutionError" in names:
+        return 40 * 10
+    for marker, code in IDEA_REASONS:
+        if marker in text:
+            return 40 * code
+    return 40 * 11

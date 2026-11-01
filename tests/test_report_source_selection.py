@@ -233,3 +233,16 @@ def test_unstated_requirement_never_trims_the_model_selection(settings, tmp_path
                                      "materials": ["本地论文文件夹内指定的电池回收 PDF"]},
                                     settings, FakeClient([choice(picked)]), Deadline(900))
     assert paths == picked
+
+
+def test_idea_gets_a_second_repair_and_keeps_the_draft_with_fewest_blockers(paper_settings):
+    from handlers.e_idea import IdeaHandler
+    settings, paths = paper_settings
+    good = _markdown([p.name for p in paths])
+    too_long = good.replace("## 参考文献", "补充说明。" * 1500 + "\n\n## 参考文献")
+    client = FakeClient([too_long, too_long, good])
+    payload = IdeaHandler().handle({"case_id": "E-01", "input": "提出城市绿地温度研究方案",
+                                    "materials": [str(p) for p in paths]}, settings, client)
+    assert len(client.calls) == 3
+    assert "800～4500字符" in client.calls[1][-1]["content"]
+    assert payload["markdown"].strip() == good.strip()
