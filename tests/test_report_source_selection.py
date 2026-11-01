@@ -262,3 +262,26 @@ def test_second_idea_repair_uses_the_kept_draft_not_the_rejected_revision(paper_
     assert "Idea maximum" in second[-1]["content"]          # the kept draft's own audit
     assert worse not in "".join(message["content"] for message in second)
     assert payload["markdown"].strip() == good.strip()
+
+
+def test_possible_papers_fill_up_to_two_beyond_the_count_and_core_is_never_cut(settings, tmp_path, monkeypatch):
+    records = _library(tmp_path, monkeypatch, designated=8)
+    z = [r.path for r in records if r.filename.startswith("z")]
+
+    def labelled(core, possible):
+        return json.dumps({"papers": [{"filename": p.name, "confidence": "core", "reason": "原文研究电池回收工艺，属于指定组。"}
+                                      for p in core]
+                          + [{"filename": p.name, "confidence": "possible", "reason": "同主题但不确定是否属于指定组。"}
+                             for p in possible]}, ensure_ascii=False)
+
+    question = {"case_id": "C-01", "input": "撰写电池回收综述，至少 5 篇指定论文",
+                "materials": ["本地论文文件夹内指定的电池回收 PDF"]}
+    client = FakeClient([labelled(z[:3], z[3:8])])
+    paths = select_report_materials(question, settings, client, Deadline(900))
+    assert paths == z[:7]  # 3 core + possibles up to 5 + 2
+    assert '"possible"' in client.calls[0][-1]["content"] and "漏掉一篇指定论文" in client.calls[0][-1]["content"]
+    # Core papers beyond the count are all kept; no possible is added then.
+    paths = select_report_materials(question, settings, FakeClient([labelled(z[:8], [])]), Deadline(900))
+    assert paths == z[:8]
+    paths = select_report_materials(question, settings, FakeClient([labelled(z[:7], z[7:8])]), Deadline(900))
+    assert paths == z[:7]

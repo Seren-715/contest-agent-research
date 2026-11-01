@@ -151,6 +151,100 @@ def survey_evidence_matrix(
     return result
 
 
+_ABSTRACT_HEAD = re.compile(r"(?im)^\s*(?:abstract|摘\s*要)\b[\s.:：—-]*")
+_CONTRIBUTION = re.compile(
+    r"(?i)\b(?:(?:following|our|main|key|primary)\s+(?:main\s+|key\s+)?contributions|"
+    r"contributions\s+(?:are|of this (?:paper|work))|we make the following|this paper makes|"
+    r"to summarize,|in summary,)")
+_CONCLUSION_HEAD = re.compile(
+    r"(?im)^\s*(?:\d+(?:\.\d+)*\.?\s*|[IVX]+\.\s*)?(?:conclusions?|concluding remarks|"
+    r"(?:discussion|summary) and conclusions?|conclusions? and future work|结论|总结)\s*$")
+_DISCUSSION_HEAD = re.compile(r"(?im)^\s*(?:\d+(?:\.\d+)*\.?\s*|[IVX]+\.\s*)?(?:discussion|summary|讨论)\s*$")
+_BACK_MATTER = re.compile(r"(?im)^\s*(?:references|bibliography|acknowledge?ments?\.?|参考文献|致谢)\b")
+
+
+def _page_texts(record: MaterialRecord) -> list[tuple[int, str]]:
+    """Rebuild each indexed page's text from its overlapping passages."""
+    pages: dict[int, str] = {}
+    for span in getattr(record, "passages", ()):
+        previous = pages.get(span.page, "")
+        pages[span.page] = previous + span.text[max(0, len(previous) - span.start):]
+    if not pages and record.text.strip():
+        return [(0, record.text)]
+    return sorted(pages.items())
+
+
+def _window(pages: list[tuple[int, str]], index: int, start: int, size: int) -> tuple[int, int, str]:
+    page, text = pages[index]
+    quote = text[start:start + size]
+    if len(quote) < size and index + 1 < len(pages):
+        quote += "\n" + pages[index + 1][1][:size - len(quote)]
+    return page, start, " ".join(quote.split())
+
+
+def core_passages(record: MaterialRecord, *, abstract_chars: int = 1500, contribution_chars: int = 900,
+                  conclusion_chars: int = 1200) -> list[tuple[str, int, str]]:
+    """Verbatim abstract, contribution statement and conclusion of one paper.
+
+    Headline claims and numbers usually sit there. Query ranking with a
+    Chinese task over English papers does not guarantee these spans reach the
+    prompt, so they are located by section wording instead. Returns
+    (label, page, quote); a part that cannot be located is left out.
+    """
+    pages = _page_texts(record)
+    found: list[tuple[str, int, str]] = []
+    for index, (page, text) in enumerate(pages[:3]):
+        match = _ABSTRACT_HEAD.search(text) or re.search(r"(?i)\babstract\b[\s.:：—-]*", text)
+        if match:
+            page, _, quote = _window(pages, index, match.end(), abstract_chars)
+            # The window is whitespace-joined: match the heading inline.
+            intro = re.search(r"(?i)\b(?:1|I)\.?\s+introduction\b", quote)
+            found.append(("摘要", page, quote[:intro.start()].strip() if intro and intro.start() > 20 else quote))
+            break
+    else:
+        if pages:
+            page, _, quote = _window(pages, 0, 0, abstract_chars)
+            found.append(("首页", page, quote))
+    for index, (page, text) in enumerate(pages[:6]):
+        match = _CONTRIBUTION.search(text)
+        if match:
+            page, _, quote = _window(pages, index, match.start(), contribution_chars)
+            found.append(("贡献陈述", page, quote))
+            break
+    for heading in (_CONCLUSION_HEAD, _DISCUSSION_HEAD):
+        located = False
+        for index in range(len(pages) - 1, len(pages) // 3 - 1, -1):
+            page, text = pages[index]
+            matches = list(heading.finditer(text))
+            if matches:
+                start = matches[-1].start()
+                back = _BACK_MATTER.search(text, matches[-1].end())
+                page, _, quote = _window(pages, index, start, conclusion_chars)
+                if back is not None and back.start() - start < conclusion_chars:
+                    page, _, quote = _window(pages, index, start, back.start() - start)
+                found.append(("结论", page, quote))
+                located = True
+                break
+        if located:
+            break
+    return [(label, page, quote) for label, page, quote in found if quote.strip()]
+
+
+def core_evidence(records: list[MaterialRecord], **limits: int) -> str:
+    """Per-paper block of core_passages(), numbered like the other evidence."""
+    blocks: list[str] = []
+    for index, record in enumerate(records, start=1):
+        check_active()
+        parts = core_passages(record, **limits)
+        lines = [f"（{label}，" + (f"PDF页{page}" if page else "页码未定位") + f"）{quote}" for label, page, quote in parts]
+        located = {label for label, _, _ in parts}
+        missing = [label for label in ("摘要", "贡献陈述", "结论") if label not in located and not
+                   (label == "摘要" and "首页" in located)]
+        note = ("未定位：" + "、".join(missing) + "（不等于论文没有）\n") if missing else ""
+        blocks.append(f"[{index}] 完整文件名：{record.filename}\n标题：{record.title[:200]}\n" + note + "\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def survey_materials_bundle(
     paths: list[Path], *, query: str = "", deadline: Deadline | None = None,
 ) -> tuple[str, list[MaterialRecord]]:

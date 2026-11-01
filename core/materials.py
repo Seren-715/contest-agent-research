@@ -135,8 +135,10 @@ def select_report_materials(
             f"题目标题：{title or '（无）'}\n任务：{query}\n材料描述：" + "；".join(descriptions)
             + "\n约束：" + (constraints_text(question) or "（无）") + "\n\n候选PDF：\n" + listing + "\n\n"
             "要求：按“属于本题指定论文”的把握从高到低排序；同一目录下与题目主题一致的一组论文通常就是指定论文；"
-            "只是主题沾边、但明显属于其他题目或其他方向的论文不要返回；不得编造文件名。"
-            "只输出JSON：{\"papers\":[{\"filename\":\"完整原名.pdf\",\"reason\":\"具体依据\"}]}。"
+            "题目点名的方法、系统或论文（包括其别名）必须找出。漏掉一篇指定论文的代价远高于多选一篇同主题论文，"
+            "因此把握大的标 confidence=\"core\"，与题目主题一致但拿不准是否属于指定组的标 \"possible\"；"
+            "明显属于其他题目或其他方向的论文不要返回；不得编造文件名。"
+            "只输出JSON：{\"papers\":[{\"filename\":\"完整原名.pdf\",\"confidence\":\"core\",\"reason\":\"具体依据\"}]}。"
         )
         try:
             timeout = deadline.timeout(settings.request_timeout, reserve=generation_reserve,
@@ -161,10 +163,21 @@ def select_report_materials(
                 continue
             name, reason = hit.get("filename"), hit.get("reason")
             if isinstance(name, str) and name in allowed and isinstance(reason, str) and len(reason.strip()) >= 8:
-                selected.setdefault(name, {"filename": name, "reason": reason.strip(), "sha256": by_name[name].sha256})
-    # No trimming: a parsed count can be incomplete ("at least 5 ... and at
-    # least 10 ..."), and cutting would drop papers the task requires. The
-    # count only informs the prompt.
+                # A missing label keeps the earlier behaviour: the paper counts as core.
+                confidence = "possible" if str(hit.get("confidence", "")).strip().lower() == "possible" else "core"
+                selected.setdefault(name, {"filename": name, "reason": reason.strip(), "sha256": by_name[name].sha256,
+                                           "confidence": confidence})
+    # Core papers are never cut: a parsed count can be incomplete ("at least
+    # 5 ... and at least 10 ..."). Uncertain same-topic papers fill up to two
+    # beyond the count, because a missed designated paper loses citation
+    # credit while an extra one does not (scoring rules, 引文溯源类).
+    core_names = [name for name, item in selected.items() if item["confidence"] == "core"]
+    possible = [name for name, item in selected.items() if item["confidence"] == "possible"]
+    kept = core_names + possible[:max(0, required + 2 - len(core_names))]
+    dropped = [name for name in possible if name not in kept]
+    if dropped:
+        logging.getLogger(__name__).warning("report_selection_possible_dropped case_id=%s count=%d", case_id, len(dropped))
+    selected = {name: selected[name] for name in selected if name in kept}
     if not selected:
         raise HandlerError("no source matched the described report scope")
     # This is a selection receipt, not a claim that model relevance is gold.

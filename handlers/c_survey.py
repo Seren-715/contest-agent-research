@@ -19,7 +19,8 @@ from core.execution import check_active
 from core.llm import ModelClient, ModelError, output_budget
 from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
-from handlers.reporting import audit, finalize, materials_bundle, survey_materials_bundle, survey_evidence_matrix
+from handlers.reporting import (audit, core_evidence, finalize, materials_bundle, survey_materials_bundle,
+                                survey_evidence_matrix)
 
 SYSTEM = (
     "你是严谨的文献综述作者，按 PaperCode 的 Gate-Honest / ClaimLedger 纪律工作："
@@ -29,7 +30,7 @@ SYSTEM = (
     "不要编造页码、数字、作者或文献。"
 )
 
-EVIDENCE_TOTAL_CHARS = 54000
+EVIDENCE_TOTAL_CHARS = 60000
 
 CLAIM_RULES = (
     "证据规则（必须逐条遵守）：\n"
@@ -100,9 +101,17 @@ class SurveyHandler:
             # dataset, metric and condition together, which numeric claims need.
             per_paper = min(2400, max(300, 14000 // len(paths)))
             base, records = materials_bundle(paths, query=query, max_chars=per_paper, deadline=deadline)
+            # Abstract, contribution statement and conclusion of every paper
+            # come first: they carry the headline claims and numbers, and the
+            # query-ranked excerpts below do not guarantee them.
+            scale = min(1.0, 5 / max(1, len(records)))
+            core = core_evidence(records, abstract_chars=int(1500 * scale) or 1, contribution_chars=int(900 * scale) or 1,
+                                 conclusion_chars=int(1200 * scale) or 1)
             matrix = survey_evidence_matrix(records, query=query,
-                                            max_total_chars=max(9000, EVIDENCE_TOTAL_CHARS - len(base) - 100))
-            block = base + "\n\n补充原文窗口（候选维度仅用于定位）：\n" + matrix
+                                            max_total_chars=max(9000, EVIDENCE_TOTAL_CHARS - len(core) - len(base) - 100))
+            block = ("核心原文（各论文的摘要、贡献陈述与结论，逐字摘录）：\n" + core
+                     + "\n\n按任务检索的原文摘录：\n" + base
+                     + "\n\n补充原文窗口（候选维度仅用于定位）：\n" + matrix)
         record_stage(settings, case_id, "evidence_ready", record_count=len(records), evidence_chars=len(block))
         extra = constraints_text(question)
         evidence_heading = (
@@ -116,6 +125,11 @@ class SurveyHandler:
             f"{block}\n\n"
             "原文摘录及候选标签不是已核实事实；先按研究问题、方法、数据与实验条件、指标、"
             "结果与比较、局限六维整理各论文事实，再写综述。缺失信息明确未核验，不补造。"
+            "评分按每篇论文的核心事实逐条核对覆盖，严重事实错误会倒扣，远重于漏写一条："
+            "每篇论文都要写清“核心原文”中的方法或系统名称（按原文写法，原文给出别名时一并写出）、"
+            "要解决的问题、核心机制、实验设置（模型、数据集或负载、硬件、对比基线）"
+            "和摘要或结论中的主要量化结果；数字连同比较对象、条件和“最高/平均”等限定词按原文保留，"
+            "不要把一篇论文的数字或结论归到另一篇。"
             "具体数值须同时核对方法、数据集、单位、指标、实验条件和比较对象；"
             "原文存在同一数字不等于支持该事实。尽量覆盖各篇论文的具体贡献和条件，"
             "不要仅写少量正确但空泛的背景。宁可少写数字，也不要写无法逐项对上原文条件的数字；"

@@ -129,3 +129,73 @@ def test_fact_check_pass_is_skipped_without_enough_time_and_when_disabled(paper_
     client = FakeClient([draft])
     SurveyHandler().handle(_survey_request(paths), settings, client)
     assert len(client.calls) == 1
+
+
+def _crowded_paper(path, index):
+    """Abstract, contributions and conclusion compete with many dense pages."""
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.set_font("Helvetica", size=9)
+    pdf.add_page()
+    pdf.multi_cell(0, 4, f"Method{index}: Goodput Oriented Serving\nAbstract\nWe present Method{index}. "
+                   f"HEADLINE{index}: latency drops by up to {index + 2}.2x versus plain decoding.\n"
+                   "1 Introduction\n" + "Serving is costly. " * 30
+                   + f"Our contributions are: CONTRIB{index} adaptive proposal length per batch.")
+    for page in range(8):
+        pdf.add_page()
+        pdf.multi_cell(0, 4, ("\nResults show speculative decoding latency throughput with the proposed method "
+                              "on the ShareGPT dataset improves 12.5% accuracy over the baseline.\nMethod details: "
+                              "we propose a draft model verification framework; limitation: batch size.\n") * 12)
+    pdf.add_page()
+    pdf.multi_cell(0, 4, f"7 Conclusion\nCONCL{index}: goodput improves across workloads. " + "Future work. " * 5)
+    pdf.output(str(path))
+    return path
+
+
+def test_survey_prompt_always_carries_abstract_contributions_and_conclusion(paper_settings, monkeypatch):
+    import handlers.c_survey as module
+    settings, paths = paper_settings
+    papers = [_crowded_paper(paths[0].parent / f"crowded{i}.pdf", i) for i in range(5)]
+    monkeypatch.delenv("CONTEST_SURVEY_EVIDENCE_MATRIX", raising=False)
+    monkeypatch.setattr(module, "finalize", lambda settings, function, case_id, markdown, paths, **kwargs: markdown)
+    client = FakeClient(["draft"])
+    SurveyHandler().handle({"case_id": "C-core", "input": "比较 speculative decoding 的 latency 与 throughput",
+                            "materials": [str(path) for path in papers]}, settings, client)
+    prompt = client.calls[0][1]["content"]
+    for index in range(5):
+        assert f"HEADLINE{index}" in prompt
+        assert f"CONTRIB{index}" in prompt
+        assert f"CONCL{index}" in prompt
+    assert "（结论，PDF页10）" in prompt
+    assert "核心事实" in prompt
+
+
+def test_core_passages_report_what_they_cannot_locate():
+    from handlers.reporting import core_evidence, core_passages
+    record = MaterialRecord(path=Path("x.pdf"), filename="x.pdf", sha256="", bytes=0, pages=2,
+                            title="X", abstract="", text="",
+                            passages=(EvidencePassage(1, 0, 40, "Plain first page without headings here."),
+                                      EvidencePassage(2, 0, 30, "More text on the second page.")))
+    assert [label for label, _, _ in core_passages(record)] == ["首页"]
+    block = core_evidence([record])
+    assert "未定位：贡献陈述、结论" in block and "[1] 完整文件名：x.pdf" in block
+
+
+def test_core_passages_use_discussion_when_no_conclusion_and_stop_at_references():
+    from handlers.reporting import core_passages
+    pages = [
+        (1, "Title\nAbstract\nWe introduce Foo, which is 2.0x faster.\n1 Introduction\nBackground text."),
+        (2, "Equal contribution. In summary, the paper makes the following contributions: a goodput metric."),
+        (3, "Body."), (4, "Body."),
+        (5, "6. Discussion\nWe presented Foo for serving.\nReferences\n[1] Someone. A paper. 2020."),
+    ]
+    record = MaterialRecord(path=Path("f.pdf"), filename="f.pdf", sha256="", bytes=0, pages=5, title="Foo",
+                            abstract="", text="",
+                            passages=tuple(EvidencePassage(page, 0, len(text), text) for page, text in pages))
+    parts = {label: (page, quote) for label, page, quote in core_passages(record)}
+    assert parts["摘要"][1].startswith("We introduce Foo, which is 2.0x faster.")
+    assert parts["摘要"][1] == "We introduce Foo, which is 2.0x faster."
+    assert parts["贡献陈述"][0] == 2
+    assert parts["贡献陈述"][1].startswith("In summary, the paper makes the following contributions: a goodput metric.")
+    assert parts["结论"][0] == 5
+    assert "We presented Foo" in parts["结论"][1] and "Someone" not in parts["结论"][1]
