@@ -326,6 +326,8 @@ def _large_corpus(monkeypatch, tmp_path, count=130):
 
 
 def test_large_library_is_screened_once_per_paper_then_verified(settings, tmp_path, monkeypatch):
+    import dataclasses
+    settings = dataclasses.replace(settings, case_budget=540.0)  # B's real limit; 180 s leaves no screen time
     paths = _large_corpus(monkeypatch, tmp_path)
     client = ScreenThenVerify()
     result = RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"},
@@ -341,6 +343,8 @@ def test_large_library_is_screened_once_per_paper_then_verified(settings, tmp_pa
 
 
 def test_failed_screen_batch_passes_its_papers_to_verification(settings, tmp_path, monkeypatch):
+    import dataclasses
+    settings = dataclasses.replace(settings, case_budget=540.0)  # B's real limit; 180 s leaves no screen time
     _large_corpus(monkeypatch, tmp_path)
     client = ScreenThenVerify(fail_screen_batches={0})
     RetrievalHandler().handle({"case_id": "B-01", "input": "adaptive decoding language inference"}, settings, client)
@@ -434,3 +438,28 @@ def test_screening_continues_when_rerank_time_remains(settings):
     kept, calls, deadline = _screen_case(settings, start=600)
     assert calls == [70, 50]
     assert not ({f"p{i:03d}.pdf" for i in range(70, 120)} <= kept)
+
+
+def test_every_screen_request_timeout_leaves_the_rerank_reserve(settings):
+    # Review: with 200 s left and a 150 s reserve, the first screen request
+    # still got a 200 s timeout; a hanging gateway then left nothing for rerank.
+    import dataclasses
+    from handlers.b_retrieval import RetrievalLimits, _screen
+    settings = dataclasses.replace(settings, request_timeout=300.0)  # production default
+    records = [MaterialRecord(Path(f"p{i:03d}.pdf"), f"p{i:03d}.pdf", "a" * 64, 1, 1, "T", "A", "text")
+               for i in range(120)]
+    ranked = [(record, 1.0) for record in records]
+    for start in (200, 400):
+        deadline = _ClockDeadline(start)
+        timeouts = []
+
+        class Hanging:
+            def complete(self, messages, timeout=None, **kwargs):
+                timeouts.append(timeout)
+                deadline.left -= timeout  # the gateway uses the whole timeout
+                raise TimeoutError("hung")
+
+        kept = _screen(Hanging(), "q", "", ranked, "q", RetrievalLimits(), deadline, settings, "B-01")
+        assert all(value <= start - 150 + 1e-6 for value in timeouts)
+        assert deadline.remaining() >= 150 - 1e-6
+        assert kept is None or len(kept) == 120  # nothing judged: everything passes through

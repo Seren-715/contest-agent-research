@@ -278,3 +278,40 @@ def test_missing_explicit_pdf_next_to_a_description_never_widens_to_the_library(
     # A found explicit paper still bounds the scope to itself.
     assert resolve_materials(["a.pdf", "missing.pdf", description], data, allow_descriptions=True,
                              lenient=True, prose_scope=True) == [root / "论文库" / "a.pdf"]
+
+
+@pytest.mark.parametrize("team", ["my-team", None])
+def test_explicit_paths_into_another_teams_workspace_are_rejected(mount, monkeypatch, tmp_path, team):
+    # Review: shared data root holding several team folders; an explicit path
+    # (or a library link) into another team's folder was still read.
+    for key in ("TEAM_ID", "CONTEST_TEAM", "RESEARCH_WORKSPACE_TEAM"):
+        monkeypatch.delenv(key, raising=False)
+    if team:
+        monkeypatch.setenv("RESEARCH_WORKSPACE_TEAM", team)
+        (mount[1] / team / "assigned").mkdir(parents=True)
+    data, root = mount
+    other = root / "other-team"
+    (other / "dispatch.json").parent.mkdir(parents=True, exist_ok=True)
+    (other / "dispatch.json").write_text("{}", encoding="utf-8")
+    secret = _pdf(other / "论文库" / "x.pdf")
+    shared = _pdf(root / "论文库" / "ok.pdf")
+    for declared in ([str(secret)], [str(other)], ["data/other-team/论文库/x.pdf"], ["other-team/论文库/x.pdf"],
+                     ["data/other-team"]):
+        with pytest.raises(MaterialResolutionError):
+            resolve_materials(declared, data)
+        with pytest.raises(MaterialResolutionError):
+            resolve_materials(declared, data, lenient=True)
+    _symlink(root / "论文库" / "link.pdf", secret)
+    with pytest.raises(MaterialResolutionError):
+        resolve_materials(["link.pdf"], data)
+    library = resolve_materials(["本地论文文件夹内的 PDF"], data, allow_descriptions=True, lenient=True)
+    assert library == [shared]
+
+
+def test_own_team_workspace_stays_readable_by_explicit_path(mount, monkeypatch):
+    monkeypatch.setenv("RESEARCH_WORKSPACE_TEAM", "my-team")
+    data, root = mount
+    (root / "my-team" / "assigned").mkdir(parents=True)
+    paper = _pdf(root / "my-team" / "论文库" / "x.pdf")
+    assert resolve_materials([str(paper)], data) == [paper]
+    assert resolve_materials(["data/my-team/论文库/x.pdf"], data) == [paper]

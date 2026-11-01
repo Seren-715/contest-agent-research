@@ -778,12 +778,27 @@ def resolve_materials(
     # A whole data root may hold other teams' directories and is never walked.
     search_roots = [root for root in roots if root.name in ("论文库", "papers")] + team_dirs
 
+    def foreign_team(path: Path, bases: list[Path]) -> bool:
+        """Whether a folder between a data root and ``path`` is another team's
+        workspace (it holds assigned/ or dispatch.json). Without a configured
+        team name every team workspace counts as foreign."""
+        for base in bases:
+            if path != base and base not in path.parents:
+                continue
+            for folder in [path] + [parent for parent in path.parents if base in parent.parents]:
+                if folder.is_dir() and _is_team_dir(folder) and not (team and folder.name == team
+                                                                      and folder.parent == base):
+                    return True
+        return False
+
     def within(path: Path) -> bool:
         # Both the declared location and the real target (after symlinks) must
         # lie inside a data root: the spec forbids symlinks that leave it.
+        # Neither may lie in another team's workspace (explicit paths too).
         lexical, resolved = _lexical(path), path.resolve()
         return (any(lexical == base or base in lexical.parents for base in allowed)
-                and any(resolved == base or base in resolved.parents for base in resolved_bases))
+                and any(resolved == base or base in resolved.parents for base in resolved_bases)
+                and not foreign_team(lexical, allowed) and not foreign_team(resolved, resolved_bases))
 
     def checked(path: Path) -> Path:
         if not within(path):

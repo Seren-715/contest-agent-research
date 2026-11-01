@@ -73,7 +73,7 @@ def _has_cjk(text: str) -> bool:
 
 
 def _expand_query(client: ModelClient, query: str, deadline: Deadline, timeout: float,
-                  attempts: int = 2) -> list[str]:
+                  attempts: int = 2, reserve: float = 0.0) -> list[str]:
     """Translate a Chinese search request into English keywords.
 
     The local paper library is often English while the contest query is Chinese.
@@ -84,14 +84,15 @@ def _expand_query(client: ModelClient, query: str, deadline: Deadline, timeout: 
     for attempt in range(1, attempts + 1):
         if attempt > 1 and deadline.remaining() < 30:
             break
-        values = _expand_query_once(client, query, deadline, timeout)
+        values = _expand_query_once(client, query, deadline, timeout, reserve)
         if values:
             return values
         LOGGER.warning("B query expansion produced no keywords (attempt %d/%d)", attempt, attempts)
     return []
 
 
-def _expand_query_once(client: ModelClient, query: str, deadline: Deadline, timeout: float) -> list[str]:
+def _expand_query_once(client: ModelClient, query: str, deadline: Deadline, timeout: float,
+                       reserve: float = 0.0) -> list[str]:
     try:
         text = client.complete(
             [
@@ -109,7 +110,7 @@ def _expand_query_once(client: ModelClient, query: str, deadline: Deadline, time
             ],
             temperature=0.1,
             max_tokens=output_budget(),
-            timeout=deadline.timeout(timeout, label="query expansion"),
+            timeout=deadline.timeout(timeout, reserve=reserve, label="query expansion"),
         )
         data = extract_json_object(text)
         values = data.get("keywords")
@@ -196,9 +197,9 @@ def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[Mate
         batch = ranked[offset:offset + limits.screen_batch]
         names = {record.filename.casefold() for record, _ in batch}
         expected = per_paper * len(batch) if per_paper is not None else 0.0
-        if deadline.remaining() < 60 or (
-                per_paper is not None
-                and deadline.remaining() - expected < max(limits.rerank_reserve, last)):
+        before = deadline.remaining()
+        if before < 60 or before - limits.rerank_reserve < 30 or (
+                per_paper is not None and before - expected < max(limits.rerank_reserve, last)):
             # Unscreened papers were never judged: pass them all through, like
             # a failed batch, rather than dropping them. They rank lowest, so
             # the rerank still sees screened survivors first.
@@ -206,7 +207,6 @@ def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[Mate
             kept |= rest
             LOGGER.warning("B screen stopped to keep rerank time after %d papers; passing %d through", offset, len(rest))
             break
-        before = deadline.remaining()
         listing = "\n".join(
             f"{index}. {record.filename}\n" + " ".join(evidence_excerpt(
                 record, query=search_text, max_chars=limits.screen_chars).split())
@@ -225,7 +225,9 @@ def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[Mate
                 [{"role": "system", "content": SCREEN_SYSTEM}, {"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=output_budget(),
-                timeout=deadline.timeout(settings.request_timeout, label="retrieval screen"),
+                # A hanging request must not eat the rerank reserve either.
+                timeout=deadline.timeout(settings.request_timeout, reserve=limits.rerank_reserve,
+                                         label="retrieval screen"),
             )
             raw = extract_json_object(text).get("papers")
             if not isinstance(raw, list):
@@ -293,7 +295,8 @@ class RetrievalHandler:
         search_text = query
         keywords: list[str] = []
         if _has_cjk(query):
-            keywords = _expand_query(client, query, deadline, settings.request_timeout)
+            keywords = _expand_query(client, query, deadline, settings.request_timeout,
+                                     reserve=limits.rerank_reserve)
             if keywords:
                 search_text = query + " " + " ".join(keywords)
         record_stage(settings, case_id, "query_expanded", cjk=_has_cjk(query), keyword_count=len(keywords))
