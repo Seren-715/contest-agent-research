@@ -35,6 +35,7 @@ except ImportError:  # local development without the official base image
 
 from core.config import case_timeout_seconds, load_settings
 from core.execution import ExecutionControl, execution_context
+from core.failure_code import failure_delay
 from core.io import write_result
 from core.schemas import validate_answer
 from core.solve import (
@@ -133,6 +134,8 @@ if HAS_SDK:
                 try:
                     body = normalize_task_input(body)
                 except Exception:
+                    if os.environ.get("CONTEST_FAILURE_TIMING", "1") != "0":
+                        await asyncio.sleep(190)  # timing code: rejected before any handler
                     return JSONResponse(
                         {"code": "ERR_BAD_QUESTION", "message": "invalid case identity or function"},
                         status_code=400,
@@ -174,6 +177,13 @@ if HAS_SDK:
                     try:
                         output = _safe_fallback(case_id, function, body)
                     except Exception:
+                        if function == "Literature_Retrieval":
+                            # The platform shows no logs; encode the failing
+                            # phase/error in the visible processing time.
+                            delay = failure_delay(load_settings(), case_id, error)
+                            logging.getLogger(__name__).warning(
+                                "retrieval_failure_timing case_id=%s delay=%d", case_id, delay)
+                            await asyncio.sleep(delay)
                         return JSONResponse(
                             {"code": "ERR_CASE_FAILED", "message": "case failed without a valid answer"},
                             status_code=503,
