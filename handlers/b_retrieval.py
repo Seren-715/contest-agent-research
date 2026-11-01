@@ -252,7 +252,7 @@ class RetrievalHandler:
         query = question_text(question)
         record_stage(settings, case_id, "material_resolution")
         paths = resolve_materials(question.get("materials"), settings.data_dir,
-                                  allow_library=True, allow_descriptions=True)
+                                  allow_library=True, allow_descriptions=True, lenient=True)
         record_stage(settings, case_id, "materials_resolved", resolved_count=len(paths))
         if not paths:
             return {"case_id": case_id, "papers": []}
