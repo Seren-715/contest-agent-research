@@ -396,7 +396,16 @@ def index_materials(
                     warnings.append("pdf_page_limit")
                 else:
                     selected = list(range(pages))
-                per_page = min(12000, min(char_limit, total_chars) // max(1, len(selected)))
+                # Fair share of the remaining characters, like the time share:
+                # files read first must not use up the budget of later files
+                # (a 120-paper library left the last 17 with no text at all).
+                share = total_chars // (len(paths) - position)
+                file_chars = min(char_limit, share)
+                if share < char_limit and file_chars // max(1, len(selected)) < 300 and len(selected) > 1:
+                    # Too thin to spread: keep the leading pages (title, abstract).
+                    selected = selected[:max(1, file_chars // 300)]
+                    warnings.append("file_char_share")
+                per_page = min(12000, file_chars // max(1, len(selected)))
                 for number in selected:
                     check_active()
                     now = time.monotonic()

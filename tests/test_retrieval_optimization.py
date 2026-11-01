@@ -383,3 +383,54 @@ def test_screen_out_of_time_passes_unscreened_papers_through(settings, tmp_path)
     kept = _screen(client, "adaptive decoding", "", ranked, "adaptive decoding", limits, Clock(), settings, "B-01")
     assert len(client.calls) == 1
     assert kept == {"first.pdf", "second.pdf"}
+
+
+class _ClockDeadline:
+    """Deadline whose time advances only when the fake model 'runs'."""
+
+    def __init__(self, remaining):
+        self.left = remaining
+
+    def remaining(self):
+        return max(0.0, self.left)
+
+    def timeout(self, maximum, *, reserve=0.0, minimum=1.0, label="operation"):
+        available = min(maximum, self.left - reserve)
+        if available < minimum:
+            raise TimeoutError(label)
+        return available
+
+
+def _screen_case(settings, start, seconds_per_paper=160 / 70):
+    from handlers.b_retrieval import RetrievalLimits, _screen
+    records = [MaterialRecord(Path(f"p{i:03d}.pdf"), f"p{i:03d}.pdf", "a" * 64, 1, 1, "T", "A",
+                              "speculative decoding latency study")
+               for i in range(120)]
+    ranked = [(record, 1.0 / (i + 1)) for i, record in enumerate(records)]
+    deadline = _ClockDeadline(start)
+    calls = []
+
+    class Model:
+        def complete(self, messages, **kwargs):
+            names = re.findall(r"^\d+\. (p\d+\.pdf)", messages[-1]["content"], re.M)
+            calls.append(len(names))
+            deadline.left -= seconds_per_paper * len(names)
+            return json.dumps({"papers": [{"filename": name} for name in names[::3]]})
+
+    kept = _screen(Model(), "q", "", ranked, "q", RetrievalLimits(), deadline, settings, "B-01")
+    return kept, calls, deadline
+
+
+def test_screening_stops_early_to_leave_rerank_time_and_passes_the_rest_through(settings):
+    # Stress simulation (1.5x latency): two screens left 92 s, the first rerank
+    # timed out and the whole B case failed with no answer.
+    kept, calls, deadline = _screen_case(settings, start=400)
+    assert calls == [70]                       # the second screen would not leave rerank time
+    assert {f"p{i:03d}.pdf" for i in range(70, 120)} <= kept   # unscreened papers pass through
+    assert deadline.remaining() == pytest.approx(240)
+
+
+def test_screening_continues_when_rerank_time_remains(settings):
+    kept, calls, deadline = _screen_case(settings, start=600)
+    assert calls == [70, 50]
+    assert not ({f"p{i:03d}.pdf" for i in range(70, 120)} <= kept)

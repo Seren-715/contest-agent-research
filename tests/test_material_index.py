@@ -400,3 +400,17 @@ def test_failed_page_attempt_respects_file_share_and_preserves_later_files(tmp_p
     assert "page_extract_failed:2" not in records[0].warnings
     assert "index_time_limit" in records[0].warnings
     assert all(record.text.strip() for record in records[1:])
+
+
+def test_total_character_budget_is_shared_across_files_not_spent_in_filename_order(tmp_path, monkeypatch):
+    # B simulation (120 real arXiv PDFs): the 8M-character budget was used up by
+    # the first ~100 files, and the last 17 got no text and were dropped.
+    monkeypatch.setenv("CONTEST_INDEX_MAX_CHARS", "6000")
+    paths = []
+    for index in range(6):
+        path = tmp_path / f"p{index}.pdf"
+        make_pdf(path, [f"PAPER{index} " + "body text " * 200, "more body " * 200])
+        paths.append(path)
+    records = index_materials(paths)
+    assert all(f"PAPER{index}" in record.text for index, record in enumerate(records))
+    assert sum(len(record.text) for record in records) <= 6000 + 2 * len(records)

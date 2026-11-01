@@ -50,13 +50,17 @@ class RetrievalLimits:
     screen_threshold: int = 40
     screen_batch: int = 70
     screen_chars: int = 500
+    # Seconds the screen must leave for the detailed rerank (at least the
+    # last screen call's duration). Without it, a slow gateway let screening
+    # use the time and the first rerank timed out: no answer at all.
+    rerank_reserve: int = 150
 
     @classmethod
     def from_env(cls) -> "RetrievalLimits":
         defaults = cls()
         values = {}
         for field in ("candidates", "batch_size", "batches", "results", "excerpt_chars",
-                      "screen_threshold", "screen_batch", "screen_chars"):
+                      "screen_threshold", "screen_batch", "screen_chars", "rerank_reserve"):
             value = int(os.environ.get("CONTEST_B_" + field.upper(), getattr(defaults, field)))
             if value <= 0:
                 raise ValueError("CONTEST_B_" + field.upper() + " must be positive")
@@ -185,17 +189,24 @@ def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[Mate
     """
     kept: set[str] = set()
     succeeded = 0
+    per_paper = None  # observed seconds per screened paper
+    last = 0.0        # duration of the last screen call
     for offset in range(0, len(ranked), limits.screen_batch):
         check_active()
         batch = ranked[offset:offset + limits.screen_batch]
         names = {record.filename.casefold() for record, _ in batch}
-        if deadline.remaining() < 60:
+        expected = per_paper * len(batch) if per_paper is not None else 0.0
+        if deadline.remaining() < 60 or (
+                per_paper is not None
+                and deadline.remaining() - expected < max(limits.rerank_reserve, last)):
             # Unscreened papers were never judged: pass them all through, like
-            # a failed batch, rather than dropping them.
+            # a failed batch, rather than dropping them. They rank lowest, so
+            # the rerank still sees screened survivors first.
             rest = {record.filename.casefold() for record, _ in ranked[offset:]}
             kept |= rest
-            LOGGER.warning("B screen stopped at deadline after %d papers; passing %d through", offset, len(rest))
+            LOGGER.warning("B screen stopped to keep rerank time after %d papers; passing %d through", offset, len(rest))
             break
+        before = deadline.remaining()
         listing = "\n".join(
             f"{index}. {record.filename}\n" + " ".join(evidence_excerpt(
                 record, query=search_text, max_chars=limits.screen_chars).split())
@@ -224,7 +235,11 @@ def _screen(client: ModelClient, query: str, extra: str, ranked: list[tuple[Mate
             record_stage(settings, case_id, "model_screen_failed", error_type=type(exc).__name__)
             LOGGER.warning("B screen batch failed (%s); passing its %d papers through", type(exc).__name__, len(batch))
             kept |= names
+            last = max(0.0, before - deadline.remaining())
+            per_paper = last / len(batch)
             continue
+        last = max(0.0, before - deadline.remaining())
+        per_paper = last / len(batch)
         succeeded += 1
         for item in raw:
             key = str(item.get("filename", "")).strip().casefold() if isinstance(item, dict) else str(item).strip().casefold()
