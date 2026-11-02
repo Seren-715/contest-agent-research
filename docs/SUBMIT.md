@@ -103,3 +103,21 @@ ls -lh contest-agent.tar
 - [ ] API Key 未提交到 git；运行时注入，或经确认后写入镜像
 - [ ] A/B 外层≤540秒、C/D/E≤900秒；D客户端≤880秒，且所有阶段共享本题剩余预算
 - [ ] C 正文≤5000字符、引用组≤40，E正文≤4500；失败不以通用模板或补字冒充完成
+
+## 7. 脚本发起评测（`scripts/submit_eval.py`）
+
+平台接口没有公开文档，本仓库也连不上平台，所以脚本不猜接口，只重放浏览器里那条真实的「发起评测」请求。
+
+1. 在网页上照常上传 tar，等状态变成 READY。DevTools 复制上传请求时会去掉文件内容，所以上传这一步不能用脚本重放。
+2. 打开 F12 → Network，点「发起评测」，在列表里找到这条请求，右键 → Copy → **Copy as cURL (bash)**，存成仓库外的文件，例如 `~/eval.curl`。文件里有登录 Cookie，不要提交或外传（仓库已忽略 `*.curl`）。
+3. 先检查脚本能不能解析，这一步只解析、不发请求：`python3 scripts/submit_eval.py ~/eval.curl --dry-run`
+4. 正式运行：`python3 scripts/submit_eval.py ~/eval.curl --interval 60 --max-minutes 120`
+
+判定规则：
+
+- 2xx 且响应里有 `eval-YYYYMMDD-…` 编号，没有忙碌字样 → 成功，打印编号后退出。
+- 429/409/5xx，或响应里有"排队、评测中、稍后"等字样 → 按间隔重试。重试间隔最小 20 秒，带 ±随机抖动，并遵守 `Retry-After`。
+- 401/403 → 登录过期，退出。
+- 其他响应，或同时有编号和忙碌字样 → 停止，不盲目重放有副作用的请求。看清响应后，可以用 `--ok-pattern` / `--busy-pattern` 调整判定。
+
+Cookie 和 Token 经 stdin 传给 curl，不出现在命令行里，日志中也会脱敏。

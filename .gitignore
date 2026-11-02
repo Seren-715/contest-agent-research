@@ -35,3 +35,6 @@ agent_config.json
 
 # Local-only D references (never shipped)
 vendor/reference/
+
+# Copied browser requests (contain login cookies)
+*.curl
