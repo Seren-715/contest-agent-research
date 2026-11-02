@@ -402,3 +402,89 @@ def test_pipeline_still_calls_formal_when_selftest_is_skipped(tmp_path, settings
     assert result["status"] == "completed"
     assert called["case_id"] == "D-01"
     assert client.calls == 1
+
+
+ALT_SOURCE = GOOD_SOURCE.replace("baseline = [labels[0]] * n", "baseline = [labels[-1]] * n")
+
+
+class SequenceClient:
+    """Returns the given sources in order and records each call's prompt."""
+
+    def __init__(self, sources) -> None:
+        self.sources = list(sources)
+        self.prompts = []
+        self.temperatures = []
+
+    def complete_raw(self, messages, **kwargs):
+        self.prompts.append(messages[-1]["content"])
+        self.temperatures.append(kwargs.get("temperature"))
+        code = self.sources[min(len(self.prompts), len(self.sources)) - 1]
+        return {"choices": [{"finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "```python\n" + code + "\n```"}}]}
+
+
+def _crosscheck_settings(tmp_path, settings):
+    case = _case_dir(tmp_path)
+    settings = dataclasses.replace(
+        settings, workspace_root=tmp_path, data_dir=tmp_path / "data",
+        team_dir=tmp_path / "data" / "test-team", expert_dir=tmp_path / "data" / "expert",
+        figure_dir=tmp_path / "data" / "figure" / "test-team", d_materials_root=case.parent,
+        d_samples_root=None, d_selftest=True, d_crosscheck=True, d_selftest_timeout=10.0,
+        case_budget=120.0, d_formal_reserve=5.0,
+    )
+    settings.ensure_dirs()
+    return settings
+
+
+def _run_crosscheck(tmp_path, settings, monkeypatch, client):
+    monkeypatch.setattr(pipeline_module, "CROSSCHECK_START_SECONDS", 10.0)
+    monkeypatch.setattr(pipeline_module, "CROSSCHECK_SETTLE_SECONDS", 5.0)
+    called = {}
+
+    def fake_client(case_id, implementation, timeout_seconds=120.0):
+        called["implementation"] = implementation
+        return {"case_id": case_id, "status": "completed", "metrics": [], "figures": []}
+
+    monkeypatch.setattr(pipeline_module, "run_experiment_client", fake_client)
+    pipeline_module.run_case({"case_id": "D-01", "input": "复现"}, settings, client)
+    diagnostics = json.loads((settings.team_dir / "work" / "D-01" / "d-diagnostics.json").read_text(encoding="utf-8")) \
+        if (settings.team_dir / "work" / "D-01" / "d-diagnostics.json").exists() else None
+    return called["implementation"], diagnostics
+
+
+def test_crosscheck_keeps_first_source_when_candidates_agree(tmp_path, settings, monkeypatch) -> None:
+    settings = _crosscheck_settings(tmp_path, settings)
+    client = SequenceClient([GOOD_SOURCE, GOOD_SOURCE])
+    implementation, _ = _run_crosscheck(tmp_path, settings, monkeypatch, client)
+    assert len(client.prompts) == 2
+    assert client.temperatures[1] > client.temperatures[0]
+    assert implementation.endswith("implementation.py")
+
+
+def test_crosscheck_asks_model_to_settle_disagreement(tmp_path, settings, monkeypatch) -> None:
+    settings = _crosscheck_settings(tmp_path, settings)
+    client = SequenceClient([GOOD_SOURCE, ALT_SOURCE, ALT_SOURCE])
+    implementation, _ = _run_crosscheck(tmp_path, settings, monkeypatch, client)
+    assert len(client.prompts) == 3
+    settle = client.prompts[2]
+    assert "【实现A】" in settle and "【实现B】" in settle and "$.baseline" in settle
+    assert "不要按哪个指标更好来选" in settle
+    assert implementation.endswith("implementation-crosscheck.py")
+    # Saved verbatim from the model reply.
+    assert Path(implementation).read_text(encoding="utf-8").strip() == ALT_SOURCE.strip()
+
+
+def test_crosscheck_keeps_first_source_when_alternative_fails(tmp_path, settings, monkeypatch) -> None:
+    settings = _crosscheck_settings(tmp_path, settings)
+    client = SequenceClient([GOOD_SOURCE, BAD_SOURCE])
+    implementation, _ = _run_crosscheck(tmp_path, settings, monkeypatch, client)
+    assert len(client.prompts) == 2
+    assert implementation.endswith("implementation.py")
+
+
+def test_differences_ignore_timing_and_float_noise() -> None:
+    left = {"a": [1.0, 2.0], "elapsed_ms": 3, "nested": {"runtime_seconds": 1.0, "x": 0.1 + 0.2}}
+    right = {"a": [1.0, 2.0], "elapsed_ms": 9, "nested": {"runtime_seconds": 7.0, "x": 0.3}}
+    assert pipeline_module._differences(left, right) == []
+    assert pipeline_module._differences({"a": [1, 2]}, {"a": [1, 3]}) == ["$.a[1]: A=2.0 B=3.0"]
+    assert pipeline_module._differences({"a": 1}, {"b": 1}) == ["$.a: 只在实现A中出现", "$.b: 只在实现B中出现"]

@@ -21,7 +21,7 @@ from core.llm import ModelClient, ModelError, output_budget
 from core.materials import select_report_materials
 from handlers.base import HandlerError, constraints_text, question_text
 from handlers.evidence import novelty_overlap
-from handlers.reporting import audit, finalize, materials_bundle
+from handlers.reporting import audit, finalize, survey_bundle
 
 SYSTEM = (
     "你是科研方案设计者，按 PaperCode 的 NoveltyCheckpoint / PaperSpine / Gate-Honest 纪律工作："
@@ -53,14 +53,21 @@ CHECKLIST = (
     "## 创新论证与可证伪方式\n"
     "## 参考文献\n\n"
     "其中「动机与已有方法局限」要先写 NoveltyCheckpoint：已有工作覆盖了什么、还缺什么、"
-    "你的方案与它们的差异是什么；「多文献互补关系」要逐篇说明补上了哪一块证据；"
-    "「复现瓶颈反思」要写清数据、环境、算力、评价口径或工程实现上的具体瓶颈；"
+    "你的方案与它们的差异是什么；「多文献互补关系」要逐篇说明补上了哪一块证据，"
+    "并写清互补机制：一篇方法的哪项局限由另一篇的哪个组件或发现弥补、组合后如何协同；"
+    "「基线、数据集与实验设计」要点名材料中出现的具体基准数据集和基线方法（带引用），"
+    "再给出你的实验分组、对照与变量；「消融与量化指标」要写出具体指标名称、计算方式和验收阈值；"
+    "「复现瓶颈反思」要结合材料写清复现这些论文时在数据、环境、算力、评价口径或工程实现上的具体瓶颈，"
+    "以及你的方案如何规避或检验它们；"
     "「可行性与失败边界」要同时说明场景可行性、落地约束（算力、延迟、数据权限、工程成本）和失败边界；"
     "「创新论证与可证伪方式」要给出可证伪的预测和判定阈值。"
 )
 
 
 IDEA_REPAIRS = 2
+# Extra ranking terms for the excerpt: the rubric's experiment-side items.
+E_EVIDENCE_TERMS = ("dataset benchmark baseline metric evaluation experiment ablation limitation "
+                    "reproducibility deployment 数据集 基准 基线 指标 实验 消融 局限 复现 部署")
 
 
 class IdeaHandler:
@@ -72,7 +79,14 @@ class IdeaHandler:
         paths = select_report_materials(question, settings, client, deadline)
         if not paths:
             raise HandlerError("idea materials are missing: no PDFs resolved")
-        block, records = materials_bundle(paths, query=query, max_chars=1500, deadline=deadline)
+        # The rubric scores datasets, metrics, reproduction bottlenecks and
+        # cross-paper complementarity: abstracts alone (the old 1500 chars per
+        # paper, ~5k tokens per case) rarely contain them. Use the same
+        # per-paper evidence as Survey: core passages, a ranked excerpt and
+        # the opening/closing text before the references.
+        per_paper = max(3000, min(8000, 40000 // len(paths)))
+        block, records = survey_bundle(paths, query=query + " " + E_EVIDENCE_TERMS,
+                                       per_paper=per_paper, deadline=deadline)
         record_stage(settings, case_id, "evidence_ready", material_count=len(paths), evidence_chars=len(block))
         overlaps = novelty_overlap(query, records)
         overlap_lines = "\n".join(

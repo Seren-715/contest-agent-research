@@ -77,6 +77,7 @@ class Settings:
     d_selftest_max_samples: int = 2
     d_max_tokens: int = 64000
     d_formal_reserve: float = 70.0
+    d_crosscheck: bool = True
     case_timeout: Optional[float] = None
     finalize_reserve: float = 10.0
 
@@ -159,6 +160,7 @@ def load_settings() -> Settings:
         d_selftest_max_samples=int(_env("CONTEST_D_SELFTEST_MAX_SAMPLES", "2") or "2"),
         d_max_tokens=int(_env("CONTEST_D_MAX_TOKENS", "64000") or "64000"),
         d_formal_reserve=float(_env("CONTEST_D_FORMAL_RESERVE", "70") or "70"),
+        d_crosscheck=_env("CONTEST_D_CROSSCHECK", "1") != "0",
         case_timeout=(float(_env("CONTEST_CASE_TIMEOUT_MS")) / 1000.0
                       if _env("CONTEST_CASE_TIMEOUT_MS") is not None else None),
         finalize_reserve=float(_env("CONTEST_FINALIZE_RESERVE", "10") or "10"),

@@ -41,6 +41,8 @@ class SampleResult:
     skipped: bool = False
     stdout_tail: str = ""
     stderr_tail: str = ""
+    # Parsed run_experiment output, kept for cross-checking two candidates.
+    result: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -259,6 +261,7 @@ def run_sample(
         errors,
         stdout_tail=proc.stdout[-1000:],
         stderr_tail=proc.stderr[-2000:],
+        result=result,
     )
 
 

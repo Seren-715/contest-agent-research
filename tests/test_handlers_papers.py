@@ -209,3 +209,29 @@ def test_e_idea_accepts_partial_citations(paper_settings) -> None:
     result = IdeaHandler().handle(question, settings, client)
     assert result["path"].startswith("data/expert/E-02-灵感Idea报告-")
     validate_answer("Idea", result)
+
+
+def test_e_idea_prompt_carries_dataset_and_limitation_evidence(tmp_path, paper_settings) -> None:
+    """The E rubric scores datasets, metrics and reproduction bottlenecks; those
+    sit deep in a paper, past the 1500-character abstract excerpt E used to send."""
+    settings, paths = paper_settings
+    filler = ("The background section discusses general urban climate context without specifics. " * 40)
+    tail = ("Experiments use the UrbanHeatBench-7 dataset with RMSE as the evaluation metric. "
+            "Limitation: reproduction requires proprietary thermal imagery that is not released.")
+    deep = paths[0].parent / "deep_paper.pdf"
+    _make_pdf(deep, "Green space cooling at district scale", filler + tail)
+    draft = _markdown([deep.name]).replace(
+        "## 动机与已有方法局限\n", "## 动机与已有方法局限\n" + "已有方法在数据条件上存在局限，需要逐项核验 [1]。" * 6)
+    client = FakeClient([draft])
+    question = {
+        "case_id": "E-01",
+        "function": "Idea",
+        "input": "提出一个关于绿地降温的可验证研究方案。",
+        "materials": [str(deep)],
+        "constraints": [],
+    }
+    IdeaHandler().handle(question, settings, client)
+    prompt = client.calls[0][-1]["content"]
+    assert "UrbanHeatBench-7" in prompt
+    assert "proprietary thermal imagery" in prompt
+    assert "具体基准数据集" in prompt and "互补机制" in prompt

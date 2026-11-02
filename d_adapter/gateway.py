@@ -85,12 +85,12 @@ def _write_generation_meta(work_dir: Path, name: str, body: dict[str, Any]) -> N
 
 
 def _complete_raw(client: ModelClient, messages: list[dict[str, str]], max_tokens: int,
-                  deadline: Deadline, reserve: float) -> dict[str, Any]:
+                  deadline: Deadline, reserve: float, temperature: float = 0.1) -> dict[str, Any]:
     """Ask for a large output, but fall back if the gateway caps max_tokens."""
     check_active()
     try:
         return client.complete_raw(
-            messages, temperature=0.1, max_tokens=max_tokens,
+            messages, temperature=temperature, max_tokens=max_tokens,
             timeout=deadline.timeout(getattr(client, "timeout", 300.0), reserve=reserve,
                                      label="model generation"),
         )
@@ -101,7 +101,7 @@ def _complete_raw(client: ModelClient, messages: list[dict[str, str]], max_token
         ):
             check_active()
             return client.complete_raw(
-                messages, temperature=0.1, max_tokens=16000,
+                messages, temperature=temperature, max_tokens=16000,
                 timeout=deadline.timeout(getattr(client, "timeout", 300.0), reserve=reserve,
                                          label="model token-limit retry"),
             )
@@ -144,21 +144,27 @@ def generate(
     deadline: Deadline,
     max_tokens: int = 64000,
     reserve: float = 0.0,
+    name: str = "initial",
+    temperature: float = 0.1,
 ) -> GeneratedSource:
+    """Generate one complete source. ``name`` other than "initial" writes an
+    independent candidate next to the first one (used for cross-checking)."""
     if not materials_dir.exists():
         raise GenerationError(f"D materials not found: {materials_dir}")
     work_dir.mkdir(parents=True, exist_ok=True)
     prompt = build_prompt(case_id, task_input, materials_dir)
 
     deadline.require(5.0, "model generation")
-    body = _complete_raw(client, [{"role": "user", "content": prompt}], max_tokens, deadline, reserve)
+    body = _complete_raw(client, [{"role": "user", "content": prompt}], max_tokens, deadline, reserve,
+                         temperature=temperature)
     check_active()
-    response_path = work_dir / "generation-response.json"
+    suffix = "" if name == "initial" else f"-{name}"
+    response_path = work_dir / f"generation-response{suffix}.json"
     write_text_file(str(response_path), json.dumps(body, ensure_ascii=False))
-    _write_generation_meta(work_dir, "initial", body)
+    _write_generation_meta(work_dir, name, body)
 
     try:
-        saved = save_generated_source(body, str(work_dir / "implementation.py"))
+        saved = save_generated_source(body, str(work_dir / f"implementation{suffix}.py"))
     except SourceError as exc:
         finish = (body.get("choices") or [{}])[0].get("finish_reason")
         raise GenerationError(f"source extraction failed (finish_reason={finish!r}): {exc}") from exc
@@ -217,4 +223,51 @@ def repair(
         saved = save_generated_source(body, str(work_dir / f"implementation-repair-{attempt}.py"))
     except SourceError as exc:
         raise GenerationError(f"repair extraction failed: {exc}") from exc
+    return GeneratedSource(path=Path(saved["path"]), sha256=saved["sha256"], response_path=response_path)
+
+
+ADJUDICATE_REQUEST = (
+    "\n\n上面是本轮任务材料。针对同一材料，模型独立写出了下面两份完整实现，"
+    "它们在本轮样例输入上的输出不一致。请逐条对照材料规定的方法、参数、步骤、并列/边界规则和返回结构，"
+    "判断哪一份（或两份都有）偏离了材料；不要按哪个指标更好来选。"
+    "然后返回一份完全符合材料的最终完整实现：只输出一个完整的 ```python 代码块，"
+    "不要返回补丁或拆分成多段。"
+)
+
+
+def adjudicate(
+    client: ModelClient,
+    case_id: str,
+    task_input: str,
+    materials_dir: Path,
+    work_dir: Path,
+    candidates: list[tuple[str, str]],
+    differences: str,
+    deadline: Deadline,
+    max_tokens: int = 64000,
+    reserve: float = 0.0,
+) -> GeneratedSource:
+    """Ask the model to settle two disagreeing candidates against the round's
+    materials and return one complete final source (saved verbatim)."""
+    deadline.require(5.0, "model adjudication")
+    prompt = build_prompt(case_id, task_input, materials_dir)
+    shown = "".join(
+        f"\n\n【实现{label}】\n```python\n{source}\n```" for label, source in candidates
+    )
+    body = _complete_raw(
+        client,
+        [{"role": "user", "content": prompt + ADJUDICATE_REQUEST + shown
+          + "\n\n【样例输出差异】\n" + differences}],
+        max_tokens,
+        deadline,
+        reserve,
+    )
+    check_active()
+    response_path = work_dir / "generation-response-crosscheck.json"
+    write_text_file(str(response_path), json.dumps(body, ensure_ascii=False))
+    _write_generation_meta(work_dir, "crosscheck", body)
+    try:
+        saved = save_generated_source(body, str(work_dir / "implementation-crosscheck.py"))
+    except SourceError as exc:
+        raise GenerationError(f"cross-check extraction failed: {exc}") from exc
     return GeneratedSource(path=Path(saved["path"]), sha256=saved["sha256"], response_path=response_path)
